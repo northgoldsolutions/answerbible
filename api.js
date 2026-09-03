@@ -1,4 +1,4 @@
-const API_URL = import.meta.env.VITE_API_URL || '/api'
+const API_URL = 'https://answerbible-production.up.railway.app/api'
 
 async function request(path, options = {}) {
   const url = `${API_URL}${path}`
