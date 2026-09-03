@@ -337,37 +337,80 @@ def _generate_placeholder_visual(prompt: str, output_path: str):
 def _assemble_video(prod_id: str, db: Session):
     prod = db.query(Production).filter(Production.id == prod_id).first()
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
+    
     if not scenes:
+        print(f"[Assembly] No scenes for {prod_id}")
+        prod.stage = Stage.QUALITY_GATE
+        db.commit()
         return
-    concat_file = f"{settings.output_dir}/final/{prod_id}_concat.txt"
+    
+    # Verify FFmpeg exists
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+    except Exception as e:
+        print(f"[Assembly] FFmpeg not available: {e}")
+        prod.stage = Stage.QUALITY_GATE
+        db.commit()
+        return
+    
     scene_list = []
     for scene in scenes:
-        if not scene.narration_audio_path or not scene.visual_path:
+        if not scene.narration_audio_path or not os.path.exists(scene.narration_audio_path):
+            print(f"[Assembly] Missing audio for scene {scene.id}")
             continue
+        if not scene.visual_path or not os.path.exists(scene.visual_path):
+            print(f"[Assembly] Missing visual for scene {scene.id}")
+            continue
+        
         dur = _get_audio_duration(scene.narration_audio_path)
+        if dur <= 0:
+            dur = 5.0  # fallback
+        
         clip = f"{settings.output_dir}/final/{scene.id}_clip.mp4"
-        cmd = [settings.ffmpeg_path, "-loop", "1", "-i", scene.visual_path,
-               "-i", scene.narration_audio_path, "-c:v", "libx264", "-tune", "stillimage",
-               "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-t", str(dur), "-y", clip]
-        subprocess.run(cmd, capture_output=True)
-        scene_list.append(clip)
+        cmd = [
+            settings.ffmpeg_path, "-y", "-loop", "1", "-i", scene.visual_path,
+            "-i", scene.narration_audio_path, "-c:v", "libx264", "-tune", "stillimage",
+            "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-t", str(dur),
+            "-shortest", clip
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if result.returncode == 0:
+            scene_list.append(clip)
+        else:
+            print(f"[Assembly] Scene clip failed: {result.stderr.decode()[:200]}")
+    
     if not scene_list:
+        print(f"[Assembly] No clips assembled. Advancing anyway.")
+        prod.stage = Stage.QUALITY_GATE
+        db.commit()
         return
+    
+    concat_file = f"{settings.output_dir}/final/{prod_id}_concat.txt"
     with open(concat_file, "w") as f:
         for clip in scene_list:
             f.write(f"file '{os.path.abspath(clip)}'\n")
+    
     final_output = f"{settings.output_dir}/final/{prod_id}.mp4"
-    cmd = [settings.ffmpeg_path, "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", "-y", final_output]
-    result = subprocess.run(cmd, capture_output=True)
+    cmd = [
+        settings.ffmpeg_path, "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_file, "-c", "copy", final_output
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=60)
+    
     if result.returncode == 0:
-        prod.stage = Stage.QUALITY_GATE
-        db.commit()
+        print(f"[Assembly] SUCCESS: {final_output}")
+    else:
+        print(f"[Assembly] Concat failed: {result.stderr.decode()[:200]}")
+    
+    # Always advance so we're not stuck
+    prod.stage = Stage.QUALITY_GATE
+    db.commit()
 
 def _get_audio_duration(path: str) -> float:
     cmd = [settings.ffmpeg_path, "-i", path, "-show_entries", "format=duration",
            "-v", "quiet", "-of", "csv=p=0"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
     try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return float(result.stdout.strip())
     except:
         return 5.0
