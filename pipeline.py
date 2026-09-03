@@ -12,6 +12,7 @@ import requests
 from models import Production, Claim, Scene, ReviewDecision, Stage, ReviewStatus, Confidence, ClaimType, DoctrinalCategory, get_engine, SessionLocal
 from config import settings
 from theology_gate import run_theology_gate
+from r2_storage import upload_video
 
 router = APIRouter()
 
@@ -200,10 +201,10 @@ def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
             if claim and claim.evidence_status != ReviewStatus.FAIL:
                 claim.evidence_notes = (claim.evidence_notes or "") + f"\n[WARNING:{w['rule']}] {w['detail']}"
 
-    # ALWAYS advance stage — ReviewDecision tracks pass/fail, not the stage column
+    # ALWAYS advance stage
     prod.stage = Stage.EVIDENCE_GATE
 
-    # If no actual violations, mark claims as PASS even if manual review is required
+    # If no actual violations, mark claims as PASS
     if len(result.violations) == 0:
         for claim in claims:
             claim.evidence_status = ReviewStatus.PASS
@@ -290,8 +291,13 @@ def _produce_scenes(prod_id: str):
                 continue
             if settings.elevenlabs_api_key and scene.narration_text:
                 audio_path = f"{settings.output_dir}/audio/{scene.id}.mp3"
-                _elevenlabs_tts(scene.narration_text, audio_path)
-                scene.narration_audio_path = audio_path
+                if _elevenlabs_tts(scene.narration_text, audio_path):
+                    scene.narration_audio_path = audio_path
+                else:
+                    print(f"[TTS] ElevenLabs failed for scene {scene.id}, trying OpenAI fallback")
+                    if settings.openai_api_key:
+                        _openai_tts(scene.narration_text, audio_path)
+                        scene.narration_audio_path = audio_path
             elif settings.openai_api_key and scene.narration_text:
                 audio_path = f"{settings.output_dir}/audio/{scene.id}.mp3"
                 _openai_tts(scene.narration_text, audio_path)
@@ -316,15 +322,26 @@ def _elevenlabs_tts(text: str, output_path: str):
     headers = {"xi-api-key": settings.elevenlabs_api_key, "Content-Type": "application/json"}
     payload = {"text": text, "model_id": "eleven_monolingual_v1",
                "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}}
-    resp = requests.post(url, json=payload, headers=headers)
-    with open(output_path, "wb") as f:
-        f.write(resp.content)
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            print(f"[TTS] ElevenLabs ERROR {resp.status_code}: {resp.text[:200]}")
+            return False
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+        return True
+    except Exception as e:
+        print(f"[TTS] ElevenLabs exception: {e}")
+        return False
 
 def _openai_tts(text: str, output_path: str):
     import openai
-    client = openai.OpenAI(api_key=settings.openai_api_key)
-    response = client.audio.speech.create(model="tts-1", voice="alloy", input=text)
-    response.stream_to_file(output_path)
+    try:
+        client = openai.OpenAI(api_key=settings.openai_api_key)
+        response = client.audio.speech.create(model="tts-1", voice="alloy", input=text)
+        response.stream_to_file(output_path)
+    except Exception as e:
+        print(f"[TTS] OpenAI exception: {e}")
 
 def _generate_placeholder_visual(prompt: str, output_path: str):
     safe = prompt.replace("'", "").replace('"', '')[:100]
@@ -337,22 +354,11 @@ def _generate_placeholder_visual(prompt: str, output_path: str):
 def _assemble_video(prod_id: str, db: Session):
     prod = db.query(Production).filter(Production.id == prod_id).first()
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
-    
     if not scenes:
-        print(f"[Assembly] No scenes for {prod_id}")
         prod.stage = Stage.QUALITY_GATE
         db.commit()
         return
-    
-    # Verify FFmpeg exists
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
-    except Exception as e:
-        print(f"[Assembly] FFmpeg not available: {e}")
-        prod.stage = Stage.QUALITY_GATE
-        db.commit()
-        return
-    
+
     scene_list = []
     for scene in scenes:
         if not scene.narration_audio_path or not os.path.exists(scene.narration_audio_path):
@@ -361,11 +367,9 @@ def _assemble_video(prod_id: str, db: Session):
         if not scene.visual_path or not os.path.exists(scene.visual_path):
             print(f"[Assembly] Missing visual for scene {scene.id}")
             continue
-        
         dur = _get_audio_duration(scene.narration_audio_path)
         if dur <= 0:
-            dur = 5.0  # fallback
-        
+            dur = 5.0
         clip = f"{settings.output_dir}/final/{scene.id}_clip.mp4"
         cmd = [
             settings.ffmpeg_path, "-y", "-loop", "1", "-i", scene.visual_path,
@@ -373,36 +377,42 @@ def _assemble_video(prod_id: str, db: Session):
             "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-t", str(dur),
             "-shortest", clip
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
-        if result.returncode == 0:
-            scene_list.append(clip)
-        else:
-            print(f"[Assembly] Scene clip failed: {result.stderr.decode()[:200]}")
-    
-    if not scene_list:
-        print(f"[Assembly] No clips assembled. Advancing anyway.")
-        prod.stage = Stage.QUALITY_GATE
-        db.commit()
-        return
-    
-    concat_file = f"{settings.output_dir}/final/{prod_id}_concat.txt"
-    with open(concat_file, "w") as f:
-        for clip in scene_list:
-            f.write(f"file '{os.path.abspath(clip)}'\n")
-    
-    final_output = f"{settings.output_dir}/final/{prod_id}.mp4"
-    cmd = [
-        settings.ffmpeg_path, "-y", "-f", "concat", "-safe", "0",
-        "-i", concat_file, "-c", "copy", final_output
-    ]
-    result = subprocess.run(cmd, capture_output=True, timeout=60)
-    
-    if result.returncode == 0:
-        print(f"[Assembly] SUCCESS: {final_output}")
-    else:
-        print(f"[Assembly] Concat failed: {result.stderr.decode()[:200]}")
-    
-    # Always advance so we're not stuck
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if result.returncode == 0:
+                scene_list.append(clip)
+            else:
+                print(f"[Assembly] Scene clip failed: {result.stderr.decode()[:200]}")
+        except Exception as e:
+            print(f"[Assembly] Scene exception: {e}")
+
+    if scene_list:
+        concat_file = f"{settings.output_dir}/final/{prod_id}_concat.txt"
+        with open(concat_file, "w") as f:
+            for clip in scene_list:
+                f.write(f"file '{os.path.abspath(clip)}'\n")
+        final_output = f"{settings.output_dir}/final/{prod_id}.mp4"
+        cmd = [
+            settings.ffmpeg_path, "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_file, "-c", "copy", final_output
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=60)
+            if result.returncode == 0:
+                print(f"[Assembly] SUCCESS: {final_output}")
+                # Upload to R2 for persistence
+                try:
+                    public_url = upload_video(prod_id, final_output)
+                    prod.video_url = public_url
+                    print(f"[R2] Uploaded: {public_url}")
+                except Exception as e:
+                    print(f"[R2] Upload failed: {e}")
+            else:
+                print(f"[Assembly] Concat failed: {result.stderr.decode()[:200]}")
+        except Exception as e:
+            print(f"[Assembly] Concat exception: {e}")
+
+    # ALWAYS advance - never get stuck
     prod.stage = Stage.QUALITY_GATE
     db.commit()
 
@@ -475,6 +485,14 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "Production not found")
     claims = db.query(Claim).filter(Claim.production_id == prod_id).all()
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
+
+    # Check for video (R2 URL or local file)
+    video_path = f"./output/final/{prod_id}.mp4"
+    has_video = bool(prod.video_url) or os.path.exists(video_path)
+    video_url = prod.video_url  # R2 public URL takes priority
+    if not video_url and os.path.exists(video_path):
+        video_url = f"/api/download/{prod_id}"  # Local fallback
+
     return {
         "id": prod.id, "topic": prod.topic, "stage": prod.stage.value,
         "doctrinal_category": prod.doctrinal_category.value,
@@ -484,9 +502,19 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         "human_review_passed": prod.human_review_passed,
         "quality_gate_passed": prod.quality_gate_passed,
         "approved_by": prod.approved_by,
+        "has_video": has_video,
+        "video_url": video_url,
         "claims": [{"id": c.id, "text": c.claim_text, "status": c.evidence_status.value,
-                    "confidence": c.confidence.value, "type": c.claim_type.value} for c in claims],
-        "scenes": [{"id": s.id, "order": s.order_index, "status": s.generation_status, "locked": s.is_locked} for s in scenes]
+                    "confidence": c.confidence.value, "type": c.claim_type.value,
+                    "source_reference": c.source_reference,
+                    "source_text": c.source_text,
+                    "context": c.context,
+                    "interpretation": c.interpretation,
+                    "cross_references": c.cross_references,
+                    "alternative_interpretations": c.alternative_interpretations,
+                    "evidence_notes": c.evidence_notes} for c in claims],
+        "scenes": [{"id": s.id, "order": s.order_index, "status": s.generation_status, "locked": s.is_locked,
+                    "narration_text": s.narration_text, "visual_prompt": s.visual_prompt} for s in scenes]
     }
 
 @router.get("/productions")
