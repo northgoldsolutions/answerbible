@@ -200,9 +200,9 @@ def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
             if claim and claim.evidence_status != ReviewStatus.FAIL:
                 claim.evidence_notes = (claim.evidence_notes or "") + f"\n[WARNING:{w['rule']}] {w['detail']}"
 
-        # ALWAYS advance stage to EVIDENCE_GATE — ReviewDecision tracks pass/fail
+    # ALWAYS advance stage — ReviewDecision tracks pass/fail, not the stage column
     prod.stage = Stage.EVIDENCE_GATE
-    
+
     if not result.passed:
         decision = ReviewDecision(
             id=str(uuid.uuid4()), production_id=prod_id, stage="evidence_gate",
@@ -211,12 +211,7 @@ def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
         )
         db.add(decision)
         db.commit()
-        return {
-            "id": prod.id,
-            "stage": prod.stage.value,
-            "decision": "FAIL",
-            ...
-        }", "decision": "FAIL",
+        return {"id": prod.id, "stage": prod.stage.value, "decision": "FAIL",
                 "violations": result.violations, "warnings": result.warnings,
                 "message": "Theological gate FAILED. Repair and resubmit."}
 
@@ -233,7 +228,6 @@ def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
         notes=f"Passed. Manual review required: {result.requires_manual}"
     )
     db.add(decision)
-    prod.stage = Stage.EVIDENCE_GATE
     db.commit()
 
     return {"id": prod.id, "stage": prod.stage.value, "decision": "PASS",
