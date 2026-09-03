@@ -200,15 +200,17 @@ def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
             if claim and claim.evidence_status != ReviewStatus.FAIL:
                 claim.evidence_notes = (claim.evidence_notes or "") + f"\n[WARNING:{w['rule']}] {w['detail']}"
 
-        # ALWAYS advance stage — ReviewDecision tracks pass/fail, not the stage column
-    prod.stage = Stage.EVIDENCE_GATE
+       # ALWAYS advance stage — ReviewDecision tracks pass/fail, not the stage column
+prod.stage = Stage.EVIDENCE_GATE
 
-    # If no actual violations, mark claims as PASS even if manual review is required
-    if len(result.violations) == 0:
-        for claim in claims:
-            claim.evidence_status = ReviewStatus.PASS
-            claim.evidence_notes = "Passed all 12 theological blockers"
-        prod.evidence_gate_passed = True
+# If no actual violations, mark claims as PASS even if manual review is required
+if len(result.violations) == 0:
+    for claim in claims:
+        claim.evidence_status = ReviewStatus.PASS
+        claim.evidence_notes = "Passed all 12 theological blockers"
+    prod.evidence_gate_passed = True
+
+if not result.passed:
 
     if not result.passed:
         decision = ReviewDecision(
