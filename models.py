@@ -1,4 +1,5 @@
 # models.py
+import os
 from sqlalchemy import create_engine, Column, String, Text, DateTime, Boolean, ForeignKey, Integer, JSON, Enum
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
