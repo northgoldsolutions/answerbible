@@ -1,7 +1,13 @@
 # main.py
+from fastapi.responses import FileResponse
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+@app.get("/api/download/{prod_id}")
+def download_video(prod_id: str):
+    file_path = f"./output/final/{prod_id}.mp4"
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="video/mp4", filename=f"{prod_id}.mp4")
+    return {"error": "Video not found. It may have been lost due to container restart."}
 from models import init_db, get_engine
 from pipeline import router as pipeline_router
 from config import settings
