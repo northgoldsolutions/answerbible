@@ -9,10 +9,36 @@ import os
 import subprocess
 import requests
 
+# R2 Storage inline (no separate file needed)
+import boto3
+from botocore.config import Config
+
+def get_r2_client():
+    account_id = os.getenv('R2_ACCOUNT_ID')
+    access_key = os.getenv('R2_ACCESS_KEY_ID')
+    secret_key = os.getenv('R2_SECRET_ACCESS_KEY')
+    if not all([account_id, access_key, secret_key]):
+        raise ValueError("Missing R2 credentials")
+    return boto3.client(
+        's3',
+        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version='s3v4')
+    )
+
+def upload_video(prod_id: str, file_path: str) -> str:
+    bucket = os.getenv('R2_BUCKET_NAME')
+    if not bucket:
+        raise ValueError("Missing R2_BUCKET_NAME")
+    key = f"videos/{prod_id}.mp4"
+    client = get_r2_client()
+    client.upload_file(file_path, bucket, key, ExtraArgs={'ContentType': 'video/mp4'})
+    return f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev/{key}"
+
 from models import Production, Claim, Scene, ReviewDecision, Stage, ReviewStatus, Confidence, ClaimType, DoctrinalCategory, get_engine, SessionLocal
 from config import settings
 from theology_gate import run_theology_gate
-from r2_storage import upload_video
 
 router = APIRouter()
 
@@ -24,7 +50,6 @@ def get_db():
     finally:
         db.close()
 
-# Schemas
 class ProductionCreate(BaseModel):
     topic: str
     source_question: Optional[str] = None
@@ -70,7 +95,6 @@ class PackagingSubmit(BaseModel):
     keywords: str
     thumbnail_prompt: str
 
-# ─── STAGE 1: CREATE ───
 @router.post("/productions")
 def create_production(data: ProductionCreate, db: Session = Depends(get_db)):
     cat_map = {
@@ -102,7 +126,6 @@ def create_production(data: ProductionCreate, db: Session = Depends(get_db)):
     db.refresh(prod)
     return {"id": prod.id, "stage": prod.stage.value, "message": "Production created. Submit research."}
 
-# ─── STAGE 2: RESEARCH ───
 @router.post("/productions/{prod_id}/research")
 def submit_research(prod_id: str, data: ResearchSubmit, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -120,7 +143,6 @@ def submit_research(prod_id: str, data: ResearchSubmit, db: Session = Depends(ge
     db.commit()
     return {"id": prod.id, "stage": prod.stage.value, "message": "Research submitted. Submit script + claims."}
 
-# ─── STAGE 3: SCRIPT ───
 @router.post("/productions/{prod_id}/script")
 def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -174,7 +196,6 @@ def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db
     db.commit()
     return {"id": prod.id, "stage": prod.stage.value, "claim_count": len(data.claims), "message": "Script submitted. Run evidence gate."}
 
-# ─── STAGE 4: EVIDENCE GATE ───
 @router.post("/productions/{prod_id}/evidence")
 def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -201,10 +222,8 @@ def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
             if claim and claim.evidence_status != ReviewStatus.FAIL:
                 claim.evidence_notes = (claim.evidence_notes or "") + f"\n[WARNING:{w['rule']}] {w['detail']}"
 
-    # ALWAYS advance stage
     prod.stage = Stage.EVIDENCE_GATE
 
-    # If no actual violations, mark claims as PASS
     if len(result.violations) == 0:
         for claim in claims:
             claim.evidence_status = ReviewStatus.PASS
@@ -237,7 +256,6 @@ def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
             "manual_review_required": result.requires_manual,
             "message": "Evidence gate passed. Awaiting human review (DAVID APPROVES)."}
 
-# ─── STAGE 5: HUMAN REVIEW ───
 @router.post("/productions/{prod_id}/review")
 def human_review(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -263,7 +281,6 @@ def human_review(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)
         db.commit()
         return {"id": prod.id, "stage": "evidence_gate", "message": f"Review: {data.decision.upper()}. Repair required."}
 
-# ─── STAGE 6: PRODUCE (TTS + Visuals) ───
 @router.post("/productions/{prod_id}/produce")
 def produce(prod_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -320,7 +337,7 @@ def _produce_scenes(prod_id: str):
 def _elevenlabs_tts(text: str, output_path: str):
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{settings.elevenlabs_voice_id}"
     headers = {"xi-api-key": settings.elevenlabs_api_key, "Content-Type": "application/json"}
-    payload = {"text": text, "model_id": "eleven_monolingual_v1",
+    payload = {"text": text, "model_id": "eleven_turbo_v2_5",
                "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}}
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
@@ -335,11 +352,18 @@ def _elevenlabs_tts(text: str, output_path: str):
         return False
 
 def _openai_tts(text: str, output_path: str):
-    import openai
     try:
-        client = openai.OpenAI(api_key=settings.openai_api_key)
-        response = client.audio.speech.create(model="tts-1", voice="alloy", input=text)
-        response.stream_to_file(output_path)
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+            json={"model": "tts-1", "voice": "alloy", "input": text},
+            timeout=30
+        )
+        if resp.status_code == 200:
+            with open(output_path, "wb") as f:
+                f.write(resp.content)
+        else:
+            print(f"[TTS] OpenAI ERROR {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         print(f"[TTS] OpenAI exception: {e}")
 
@@ -350,7 +374,6 @@ def _generate_placeholder_visual(prompt: str, output_path: str):
            "-frames:v", "1", output_path, "-y"]
     subprocess.run(cmd, capture_output=True)
 
-# ─── STAGE 7: ASSEMBLY ───
 def _assemble_video(prod_id: str, db: Session):
     prod = db.query(Production).filter(Production.id == prod_id).first()
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
@@ -400,7 +423,6 @@ def _assemble_video(prod_id: str, db: Session):
             result = subprocess.run(cmd, capture_output=True, timeout=60)
             if result.returncode == 0:
                 print(f"[Assembly] SUCCESS: {final_output}")
-                # Upload to R2 for persistence
                 try:
                     public_url = upload_video(prod_id, final_output)
                     prod.video_url = public_url
@@ -412,7 +434,6 @@ def _assemble_video(prod_id: str, db: Session):
         except Exception as e:
             print(f"[Assembly] Concat exception: {e}")
 
-    # ALWAYS advance - never get stuck
     prod.stage = Stage.QUALITY_GATE
     db.commit()
 
@@ -425,7 +446,6 @@ def _get_audio_duration(path: str) -> float:
     except:
         return 5.0
 
-# ─── STAGE 8: QUALITY GATE ───
 @router.post("/productions/{prod_id}/quality")
 def quality_gate(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -447,7 +467,6 @@ def quality_gate(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)
         db.commit()
         return {"id": prod.id, "message": "Quality check failed. Repair scenes."}
 
-# ─── STAGE 9: PACKAGING ───
 @router.post("/productions/{prod_id}/packaging")
 def submit_packaging(prod_id: str, data: PackagingSubmit, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -463,7 +482,6 @@ def submit_packaging(prod_id: str, data: PackagingSubmit, db: Session = Depends(
     db.commit()
     return {"id": prod.id, "stage": prod.stage.value, "message": "Packaging set. Final approval needed."}
 
-# ─── STAGE 10: FINAL APPROVAL ───
 @router.post("/productions/{prod_id}/approve")
 def final_approval(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -477,7 +495,6 @@ def final_approval(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_d
     db.commit()
     return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED. Ready for YouTube upload."}
 
-# ─── GET STATUS ───
 @router.get("/productions/{prod_id}")
 def get_production(prod_id: str, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -486,12 +503,11 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
     claims = db.query(Claim).filter(Claim.production_id == prod_id).all()
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
 
-    # Check for video (R2 URL or local file)
     video_path = f"./output/final/{prod_id}.mp4"
     has_video = bool(prod.video_url) or os.path.exists(video_path)
-    video_url = prod.video_url  # R2 public URL takes priority
+    video_url = prod.video_url
     if not video_url and os.path.exists(video_path):
-        video_url = f"/api/download/{prod_id}"  # Local fallback
+        video_url = f"/api/download/{prod_id}"
 
     return {
         "id": prod.id, "topic": prod.topic, "stage": prod.stage.value,
