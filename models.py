@@ -94,7 +94,7 @@ class Production(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     approved_by = Column(String)
     approved_at = Column(DateTime)
-
+    video_url = Column(String)
     claims = relationship("Claim", back_populates="production", cascade="all, delete-orphan")
     scenes = relationship("Scene", back_populates="production", cascade="all, delete-orphan")
     reviews = relationship("ReviewDecision", back_populates="production", cascade="all, delete-orphan")
