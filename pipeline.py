@@ -287,7 +287,7 @@ def produce(prod_id: str, background_tasks: BackgroundTasks, db: Session = Depen
     prod = db.query(Production).filter(Production.id == prod_id).first()
     if not prod:
         raise HTTPException(404, "Production not found")
-    if prod.stage != Stage.HUMAN_REVIEW:
+    if prod.stage not in (Stage.HUMAN_REVIEW, Stage.PRODUCTION, Stage.ASSEMBLY):
         raise HTTPException(400, f"Expected HUMAN_REVIEW, got {prod.stage.value}")
 
     failed = db.query(Claim).filter(Claim.production_id == prod_id, Claim.evidence_status != ReviewStatus.PASS).count()
@@ -299,30 +299,36 @@ def produce(prod_id: str, background_tasks: BackgroundTasks, db: Session = Depen
     background_tasks.add_task(_produce_scenes, prod_id)
     return {"id": prod.id, "stage": prod.stage.value, "message": "Production started in background."}
 
+# ============ FIXED PRODUCTION ENGINE ============
+
 def _produce_scenes(prod_id: str):
     engine = get_engine(settings.database_url)
     db = SessionLocal(bind=engine)
     try:
         scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
         for scene in scenes:
-            if scene.is_locked and scene.narration_audio_path and scene.visual_path:
+            audio_ok = scene.narration_audio_path and os.path.exists(scene.narration_audio_path)
+            visual_ok = scene.visual_path and os.path.exists(scene.visual_path)
+            if scene.is_locked and audio_ok and visual_ok:
                 continue
-            if settings.elevenlabs_api_key and scene.narration_text:
+            # --- AUDIO (never drop a scene for missing audio) ---
+            if not audio_ok:
                 audio_path = f"{settings.output_dir}/audio/{scene.id}.mp3"
-                if _elevenlabs_tts(scene.narration_text, audio_path):
-                    scene.narration_audio_path = audio_path
-                else:
-                    print(f"[TTS] ElevenLabs failed for scene {scene.id}, trying OpenAI fallback")
-                    if settings.openai_api_key:
-                        _openai_tts(scene.narration_text, audio_path)
-                        scene.narration_audio_path = audio_path
-            elif settings.openai_api_key and scene.narration_text:
-                audio_path = f"{settings.output_dir}/audio/{scene.id}.mp3"
-                _openai_tts(scene.narration_text, audio_path)
+                ok = False
+                if scene.narration_text and settings.elevenlabs_api_key:
+                    ok = _elevenlabs_tts(scene.narration_text, audio_path)
+                if not ok and scene.narration_text and settings.openai_api_key:
+                    _openai_tts(scene.narration_text, audio_path)
+                    ok = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+                if not ok:
+                    est = max(3.0, min(float(settings.max_scene_duration), len(scene.narration_text or "") * 0.06))
+                    _silent_audio(audio_path, est)
+                    print(f"[TTS] No voice generated for scene {scene.id}, using silent track")
                 scene.narration_audio_path = audio_path
-            if scene.visual_prompt:
+            # --- VISUAL (guaranteed to exist) ---
+            if not visual_ok:
                 visual_path = f"{settings.output_dir}/visuals/{scene.id}.png"
-                _generate_placeholder_visual(scene.visual_prompt, visual_path)
+                _generate_placeholder_visual(scene.visual_prompt or scene.narration_text or "Answers in Faith", visual_path)
                 scene.visual_path = visual_path
             scene.generation_status = "done"
             db.commit()
@@ -332,8 +338,29 @@ def _produce_scenes(prod_id: str):
         _assemble_video(prod_id, db)
     except Exception as e:
         print(f"Production error: {e}")
+        _fail_production(db, prod_id, f"Production error: {e}")
     finally:
         db.close()
+
+def _fail_production(db, prod_id: str, note: str):
+    """Never leave a production stuck in production/assembly — send it back for retry."""
+    try:
+        prod = db.query(Production).filter(Production.id == prod_id).first()
+        if prod and prod.stage in (Stage.PRODUCTION, Stage.ASSEMBLY):
+            prod.stage = Stage.HUMAN_REVIEW
+            db.add(ReviewDecision(
+                id=str(uuid.uuid4()), production_id=prod_id, stage="production",
+                decision=ReviewStatus.FAIL, reviewer="system", notes=note[:500]))
+            db.commit()
+            print(f"[Recovery] {prod_id} reset to HUMAN_REVIEW: {note[:200]}")
+    except Exception as e2:
+        print(f"Recovery failed: {e2}")
+
+def _silent_audio(output_path: str, seconds: float):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cmd = [settings.ffmpeg_path, "-y", "-f", "lavfi", "-i",
+           "anullsrc=r=44100:cl=stereo", "-t", str(seconds), output_path]
+    subprocess.run(cmd, capture_output=True, timeout=30)
 
 def _elevenlabs_tts(text: str, output_path: str):
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{settings.elevenlabs_voice_id}"
@@ -369,18 +396,26 @@ def _openai_tts(text: str, output_path: str):
         print(f"[TTS] OpenAI exception: {e}")
 
 def _generate_placeholder_visual(prompt: str, output_path: str):
-    safe = prompt.replace("'", "").replace('"', '')[:100]
-    cmd = [settings.ffmpeg_path, "-f", "lavfi", "-i", "color=c=darkblue:s=1280x720:d=5",
-           "-vf", f"drawtext=text='{safe}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=(h-text_h)/2",
-           "-frames:v", "1", output_path, "-y"]
-    subprocess.run(cmd, capture_output=True)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    txt_file = output_path.replace(".png", ".txt")
+    with open(txt_file, "w") as f:
+        f.write(prompt[:120])
+    cmd = [settings.ffmpeg_path, "-y", "-f", "lavfi", "-i",
+           "color=c=0x0f172a:s=1280x720:d=1", "-vf",
+           f"drawtext=textfile='{txt_file}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=(h-text_h)/2",
+           "-frames:v", "1", output_path]
+    result = subprocess.run(cmd, capture_output=True, timeout=30)
+    if result.returncode != 0 or not os.path.exists(output_path):
+        # fallback: plain dark frame so a visual ALWAYS exists
+        cmd = [settings.ffmpeg_path, "-y", "-f", "lavfi", "-i",
+               "color=c=0x0f172a:s=1280x720:d=1", "-frames:v", "1", output_path]
+        subprocess.run(cmd, capture_output=True, timeout=30)
 
 def _assemble_video(prod_id: str, db: Session):
     prod = db.query(Production).filter(Production.id == prod_id).first()
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
     if not scenes:
-        prod.stage = Stage.QUALITY_GATE
-        db.commit()
+        _fail_production(db, prod_id, "No scenes to assemble")
         return
 
     scene_list = []
@@ -394,58 +429,72 @@ def _assemble_video(prod_id: str, db: Session):
         dur = _get_audio_duration(scene.narration_audio_path)
         if dur <= 0:
             dur = 5.0
+        dur = min(dur, float(settings.max_scene_duration))
         clip = f"{settings.output_dir}/final/{scene.id}_clip.mp4"
         cmd = [
             settings.ffmpeg_path, "-y", "-loop", "1", "-i", scene.visual_path,
             "-i", scene.narration_audio_path, "-c:v", "libx264", "-tune", "stillimage",
-            "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-t", str(dur),
+            "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p", "-t", str(dur),
             "-shortest", clip
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-            if result.returncode == 0:
+            result = subprocess.run(cmd, capture_output=True, timeout=180)
+            if result.returncode == 0 and os.path.exists(clip):
                 scene_list.append(clip)
             else:
                 print(f"[Assembly] Scene clip failed: {result.stderr.decode()[:200]}")
         except Exception as e:
             print(f"[Assembly] Scene exception: {e}")
 
-    if scene_list:
-        concat_file = f"{settings.output_dir}/final/{prod_id}_concat.txt"
-        with open(concat_file, "w") as f:
-            for clip in scene_list:
-                f.write(f"file '{os.path.abspath(clip)}'\n")
-        final_output = f"{settings.output_dir}/final/{prod_id}.mp4"
-        cmd = [
-            settings.ffmpeg_path, "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_file, "-c", "copy", final_output
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=60)
-            if result.returncode == 0:
-                print(f"[Assembly] SUCCESS: {final_output}")
-                try:
-                    public_url = upload_video(prod_id, final_output)
-                    prod.video_url = public_url
-                    print(f"[R2] Uploaded: {public_url}")
-                except Exception as e:
-                    print(f"[R2] Upload failed: {e}")
-            else:
-                print(f"[Assembly] Concat failed: {result.stderr.decode()[:200]}")
-        except Exception as e:
-            print(f"[Assembly] Concat exception: {e}")
+    if not scene_list:
+        _fail_production(db, prod_id, "All scene clips failed to render")
+        return
+
+    concat_file = f"{settings.output_dir}/final/{prod_id}_concat.txt"
+    with open(concat_file, "w") as f:
+        for clip in scene_list:
+            f.write(f"file '{os.path.abspath(clip)}'\n")
+    final_output = f"{settings.output_dir}/final/{prod_id}.mp4"
+    cmd = [settings.ffmpeg_path, "-y", "-f", "concat", "-safe", "0",
+           "-i", concat_file, "-c", "copy", final_output]
+    result = subprocess.run(cmd, capture_output=True, timeout=120)
+    if result.returncode != 0 or not os.path.exists(final_output):
+        _fail_production(db, prod_id, f"Concat failed: {result.stderr.decode()[:300]}")
+        return
+
+    print(f"[Assembly] SUCCESS: {final_output}")
+    try:
+        public_url = upload_video(prod_id, final_output)
+        prod.video_url = public_url
+        print(f"[R2] Uploaded: {public_url}")
+    except Exception as e:
+        print(f"[R2] Upload failed (local file kept): {e}")
 
     prod.stage = Stage.QUALITY_GATE
     db.commit()
 
 def _get_audio_duration(path: str) -> float:
-    cmd = [settings.ffmpeg_path, "-i", path, "-show_entries", "format=duration",
-           "-v", "quiet", "-of", "csv=p=0"]
+    import re
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return float(result.stdout.strip())
-    except:
-        return 5.0
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    try:
+        result = subprocess.run([settings.ffmpeg_path, "-i", path],
+                                capture_output=True, text=True, timeout=10)
+        m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", result.stderr)
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        pass
+    return 5.0
+
+# ============ END FIXED ENGINE ============
 
 @router.post("/productions/{prod_id}/quality")
 def quality_gate(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)):
@@ -544,3 +593,15 @@ def list_productions(stage: Optional[str] = None, db: Session = Depends(get_db))
              "doctrinal_category": p.doctrinal_category.value,
              "primary_scripture": p.primary_scripture,
              "created_at": p.created_at} for p in prods]
+
+@router.delete("/productions/{prod_id}")
+def delete_production(prod_id: str, db: Session = Depends(get_db)):
+    prod = db.query(Production).filter(Production.id == prod_id).first()
+    if not prod:
+        raise HTTPException(404, "Production not found")
+    db.query(Claim).filter(Claim.production_id == prod_id).delete()
+    db.query(Scene).filter(Scene.production_id == prod_id).delete()
+    db.query(ReviewDecision).filter(ReviewDecision.production_id == prod_id).delete()
+    db.delete(prod)
+    db.commit()
+    return {"id": prod_id, "message": "Deleted"}
