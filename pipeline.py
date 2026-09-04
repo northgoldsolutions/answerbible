@@ -9,7 +9,7 @@ import os
 import subprocess
 import requests
 
-# R2 Storage inline (no separate file needed)
+# R2 Storage inline
 import boto3
 from botocore.config import Config
 
@@ -34,7 +34,8 @@ def upload_video(prod_id: str, file_path: str) -> str:
     key = f"videos/{prod_id}.mp4"
     client = get_r2_client()
     client.upload_file(file_path, bucket, key, ExtraArgs={'ContentType': 'video/mp4'})
-    return f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev/{key}"
+    public_url = os.getenv('R2_PUBLIC_URL', f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev")
+    return f"{public_url}/{key}"
 
 from models import Production, Claim, Scene, ReviewDecision, Stage, ReviewStatus, Confidence, ClaimType, DoctrinalCategory, get_engine, SessionLocal
 from config import settings
@@ -502,13 +503,13 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "Production not found")
     claims = db.query(Claim).filter(Claim.production_id == prod_id).all()
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
-
+    
     video_path = f"./output/final/{prod_id}.mp4"
     has_video = bool(prod.video_url) or os.path.exists(video_path)
     video_url = prod.video_url
     if not video_url and os.path.exists(video_path):
         video_url = f"/api/download/{prod_id}"
-
+    
     return {
         "id": prod.id, "topic": prod.topic, "stage": prod.stage.value,
         "doctrinal_category": prod.doctrinal_category.value,
