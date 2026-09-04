@@ -163,5 +163,15 @@ def get_engine(db_url=None):
 
 def init_db(engine):
     Base.metadata.create_all(bind=engine)
-
+def init_db(engine):
+    Base.metadata.create_all(bind=engine)
+    # Migration: add video_url column if missing
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    if 'productions' in inspector.get_table_names():
+        columns = [c['name'] for c in inspector.get_columns('productions')]
+        if 'video_url' not in columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE productions ADD COLUMN video_url VARCHAR"))
+                conn.commit()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False)
