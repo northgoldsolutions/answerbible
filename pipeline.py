@@ -500,37 +500,40 @@ def _generate_placeholder_visual(prompt: str, output_path: str):
 
 def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
     """Ken Burns pan/zoom on a still image — output normalized for concat.
-    Falls back to a plain static loop if the zoompan filter fails (some ffmpeg builds choke on it)."""
+    Memory-safe: zoompan generates ALL frames from a single input frame (d=frames),
+    no '-loop 1' — a looped source outruns the encoder, buffers frames unboundedly,
+    and gets ffmpeg OOM-killed on small containers (observed: rc=-9 / SIGKILL)."""
     frames = max(1, int(dur * 30))
     vf = (f"scale=1600:900:force_original_aspect_ratio=increase,crop=1600:900,"
-          f"zoompan=z='1+0.15*on/{frames}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+          f"zoompan=z='1+0.15*on/{frames}':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
           f"s=1280x720:fps=30,format=yuv420p")
     cmd = [
-        settings.ffmpeg_path, "-y", "-loop", "1", "-framerate", "30", "-i", image_path,
+        settings.ffmpeg_path, "-y", "-i", image_path,
         "-i", audio_path, "-vf", vf,
-        "-c:v", "libx264", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-t", str(dur), "-shortest", clip
+        "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-t", str(dur), clip
     ]
     result = subprocess.run(cmd, capture_output=True, timeout=180)
     if result.returncode != 0 or not os.path.exists(clip):
         print(f"[Assembly] Ken Burns render failed, retrying static. Tail: {result.stderr.decode()[-200:]}")
         vf_simple = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,format=yuv420p"
         cmd_simple = [
-            settings.ffmpeg_path, "-y", "-loop", "1", "-framerate", "30", "-i", image_path,
+            settings.ffmpeg_path, "-y", "-re", "-loop", "1", "-framerate", "30", "-i", image_path,
             "-i", audio_path, "-vf", vf_simple,
-            "-c:v", "libx264", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
             "-t", str(dur), "-shortest", clip
         ]
         result = subprocess.run(cmd_simple, capture_output=True, timeout=180)
     return result
 
 def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str):
-    """Loop/trim an AI-generated clip to narration length — normalized for concat."""
+    """Loop/trim an AI-generated clip to narration length — normalized for concat.
+    '-re' paces the looped input at realtime so frames can't buffer unboundedly (OOM guard)."""
     vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,format=yuv420p"
     cmd = [
-        settings.ffmpeg_path, "-y", "-stream_loop", "-1", "-i", video_path,
+        settings.ffmpeg_path, "-y", "-re", "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path, "-map", "0:v", "-map", "1:a", "-vf", vf,
-        "-c:v", "libx264", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-t", str(dur), clip
     ]
     return subprocess.run(cmd, capture_output=True, timeout=180)
