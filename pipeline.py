@@ -499,7 +499,8 @@ def _generate_placeholder_visual(prompt: str, output_path: str):
         subprocess.run(cmd, capture_output=True, timeout=30)
 
 def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
-    """Ken Burns pan/zoom on a still image — output normalized for concat."""
+    """Ken Burns pan/zoom on a still image — output normalized for concat.
+    Falls back to a plain static loop if the zoompan filter fails (some ffmpeg builds choke on it)."""
     frames = max(1, int(dur * 30))
     vf = (f"scale=1600:900:force_original_aspect_ratio=increase,crop=1600:900,"
           f"zoompan=z='1+0.15*on/{frames}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
@@ -510,7 +511,18 @@ def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
         "-c:v", "libx264", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-t", str(dur), "-shortest", clip
     ]
-    return subprocess.run(cmd, capture_output=True, timeout=180)
+    result = subprocess.run(cmd, capture_output=True, timeout=180)
+    if result.returncode != 0 or not os.path.exists(clip):
+        print(f"[Assembly] Ken Burns render failed, retrying static. Tail: {result.stderr.decode()[-200:]}")
+        vf_simple = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,format=yuv420p"
+        cmd_simple = [
+            settings.ffmpeg_path, "-y", "-loop", "1", "-framerate", "30", "-i", image_path,
+            "-i", audio_path, "-vf", vf_simple,
+            "-c:v", "libx264", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-t", str(dur), "-shortest", clip
+        ]
+        result = subprocess.run(cmd_simple, capture_output=True, timeout=180)
+    return result
 
 def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str):
     """Loop/trim an AI-generated clip to narration length — normalized for concat."""
@@ -554,7 +566,7 @@ def _assemble_video(prod_id: str, db: Session):
             if result.returncode == 0 and os.path.exists(clip):
                 scene_list.append(clip)
             else:
-                last_clip_error = result.stderr.decode()[:300]
+                last_clip_error = f"rc={result.returncode} | stderr tail: {result.stderr.decode()[-260:]}"
                 print(f"[Assembly] Scene clip failed: {last_clip_error[:200]}")
         except Exception as e:
             last_clip_error = f"{type(e).__name__}: {e}"
