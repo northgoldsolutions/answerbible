@@ -485,28 +485,38 @@ def _openai_tts(text: str, output_path: str):
 
 def _generate_placeholder_visual(prompt: str, output_path: str):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    W, H = _render_dims()
     txt_file = output_path.replace(".png", ".txt")
     with open(txt_file, "w") as f:
         f.write(prompt[:120])
     cmd = [settings.ffmpeg_path, "-y", "-f", "lavfi", "-i",
-           "color=c=0x0f172a:s=1280x720:d=1", "-vf",
+           f"color=c=0x0f172a:s={W}x{H}:d=1", "-vf",
            f"drawtext=textfile='{txt_file}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=(h-text_h)/2",
            "-frames:v", "1", output_path]
     result = subprocess.run(cmd, capture_output=True, timeout=30)
     if result.returncode != 0 or not os.path.exists(output_path):
         cmd = [settings.ffmpeg_path, "-y", "-f", "lavfi", "-i",
-               "color=c=0x0f172a:s=1280x720:d=1", "-frames:v", "1", output_path]
+               f"color=c=0x0f172a:s={W}x{H}:d=1", "-frames:v", "1", output_path]
         subprocess.run(cmd, capture_output=True, timeout=30)
+
+def _render_dims():
+    """1080x1920 vertical when VIDEO_ASPECT_RATIO=9:16 (TikTok/Shorts), else 1280x720."""
+    ar = os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip()
+    if ar in ("9:16", "9x16", "vertical"):
+        return 1080, 1920
+    return 1280, 720
 
 def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
     """Ken Burns pan/zoom on a still image — output normalized for concat.
     Memory-safe: zoompan generates ALL frames from a single input frame (d=frames),
     no '-loop 1' — a looped source outruns the encoder, buffers frames unboundedly,
     and gets ffmpeg OOM-killed on small containers (observed: rc=-9 / SIGKILL)."""
+    W, H = _render_dims()
+    ow, oh = int(W * 1.25), int(H * 1.25)
     frames = max(1, int(dur * 30))
-    vf = (f"scale=1600:900:force_original_aspect_ratio=increase,crop=1600:900,"
+    vf = (f"scale={ow}:{oh}:force_original_aspect_ratio=increase,crop={ow}:{oh},"
           f"zoompan=z='1+0.15*on/{frames}':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-          f"s=1280x720:fps=30,format=yuv420p")
+          f"s={W}x{H}:fps=30,format=yuv420p")
     cmd = [
         settings.ffmpeg_path, "-y", "-i", image_path,
         "-i", audio_path, "-vf", vf,
@@ -516,7 +526,7 @@ def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
     result = subprocess.run(cmd, capture_output=True, timeout=180)
     if result.returncode != 0 or not os.path.exists(clip):
         print(f"[Assembly] Ken Burns render failed, retrying static. Tail: {result.stderr.decode()[-200:]}")
-        vf_simple = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,format=yuv420p"
+        vf_simple = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30,format=yuv420p"
         cmd_simple = [
             settings.ffmpeg_path, "-y", "-re", "-loop", "1", "-framerate", "30", "-i", image_path,
             "-i", audio_path, "-vf", vf_simple,
@@ -529,7 +539,8 @@ def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
 def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str):
     """Loop/trim an AI-generated clip to narration length — normalized for concat.
     '-re' paces the looped input at realtime so frames can't buffer unboundedly (OOM guard)."""
-    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,format=yuv420p"
+    W, H = _render_dims()
+    vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30,format=yuv420p"
     cmd = [
         settings.ffmpeg_path, "-y", "-re", "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path, "-map", "0:v", "-map", "1:a", "-vf", vf,
