@@ -52,7 +52,7 @@ from models import Production, Claim, Scene, ReviewDecision, Stage, ReviewStatus
 from config import settings
 from theology_gate import run_theology_gate
 from video_providers import generate_scene_visual, provider_status
-from research import auto_research, auto_script
+from research import auto_research, auto_script, auto_script_episode
 
 router = APIRouter()
 
@@ -71,6 +71,10 @@ class ProductionCreate(BaseModel):
     primary_scripture: Optional[str] = None
     gospel_video: Optional[bool] = False
     supporting_passages: Optional[List[str]] = []
+    # Long-form build: per-production format controls
+    orientation: Optional[str] = None      # "vertical" | "landscape" | None (-> env default)
+    video_format: Optional[str] = "short"  # "short" | "episode"
+    scene_count: Optional[int] = None      # target scenes for episode auto-script (4-10)
 
 class ResearchSubmit(BaseModel):
     hook: str
@@ -89,7 +93,7 @@ class ClaimSubmit(BaseModel):
     interpretation: str
     confidence: str = "medium"
     alternative_interpretations: Optional[str] = ""
-    claim_type: str = "speculation"
+    claim_type: str = "scholarly"
     cross_references: Optional[List[str]] = []
     character_of_god_relevant: Optional[bool] = False
     gospel_relevant: Optional[bool] = False
@@ -109,6 +113,17 @@ class PackagingSubmit(BaseModel):
     keywords: str
     thumbnail_prompt: str
 
+def _normalize_orientation(raw):
+    """'vertical' | 'landscape' | None. Accepts 9:16/16:9 spellings too."""
+    if not raw:
+        return None
+    v = str(raw).strip().lower()
+    if v in ("vertical", "9:16", "9x16", "portrait"):
+        return "vertical"
+    if v in ("landscape", "16:9", "16x9", "horizontal"):
+        return "landscape"
+    return None
+
 @router.post("/productions")
 def create_production(data: ProductionCreate, db: Session = Depends(get_db)):
     cat_map = {
@@ -125,6 +140,12 @@ def create_production(data: ProductionCreate, db: Session = Depends(get_db)):
         "character_of_god": DoctrinalCategory.CHARACTER_OF_GOD,
         "prophecy_dating": DoctrinalCategory.PROPHECY_DATING,
     }
+    video_format = str(data.video_format or "short").strip().lower()
+    if video_format not in ("short", "episode"):
+        video_format = "short"
+    scene_count = None
+    if video_format == "episode":
+        scene_count = max(4, min(10, int(data.scene_count or 6)))
     prod = Production(
         id=str(uuid.uuid4()),
         topic=data.topic,
@@ -133,12 +154,17 @@ def create_production(data: ProductionCreate, db: Session = Depends(get_db)):
         doctrinal_category=cat_map.get(data.doctrinal_category, DoctrinalCategory.GENERAL),
         primary_scripture=data.primary_scripture,
         gospel_video=data.gospel_video,
-        supporting_passages=data.supporting_passages or []
+        supporting_passages=data.supporting_passages or [],
+        video_format=video_format,
+        orientation=_normalize_orientation(data.orientation),
+        scene_count=scene_count
     )
     db.add(prod)
     db.commit()
     db.refresh(prod)
-    return {"id": prod.id, "stage": prod.stage.value, "message": "Production created. Submit research."}
+    return {"id": prod.id, "stage": prod.stage.value,
+            "video_format": prod.video_format, "orientation": prod.orientation,
+            "message": "Production created. Submit research."}
 
 @router.post("/productions/{prod_id}/research")
 def submit_research(prod_id: str, data: ResearchSubmit, db: Session = Depends(get_db)):
@@ -188,33 +214,53 @@ def auto_research_endpoint(prod_id: str, db: Session = Depends(get_db)):
 
 @router.post("/productions/{prod_id}/auto-script")
 def auto_script_endpoint(prod_id: str, db: Session = Depends(get_db)):
-    """AI drafts ONE claim + ONE scene from the approved research.
+    """AI drafts script + claims from the approved research.
+    Short format: ONE claim + ONE scene. Episode format: multi-claim + multi-scene.
     Draft is returned for review only — nothing is saved until you submit."""
     prod = db.query(Production).filter(Production.id == prod_id).first()
     if not prod:
         raise HTTPException(404, "Production not found")
-    if prod.stage != Stage.RESEARCH:
-        raise HTTPException(400, f"Auto-script only works at RESEARCH stage, got {prod.stage.value}")
+    if prod.stage not in (Stage.RESEARCH, Stage.SCRIPT):
+        raise HTTPException(400, f"Auto-script only works at RESEARCH/SCRIPT stage, got {prod.stage.value}")
     try:
-        draft = auto_script(
-            prod.topic, prod.primary_scripture,
-            prod.hook, prod.problem, prod.explanation,
-            prod.story, prod.application, prod.cta
-        )
+        if (prod.video_format or "short") == "episode":
+            draft = auto_script_episode(
+                prod.topic, prod.primary_scripture,
+                prod.hook, prod.problem, prod.explanation,
+                prod.story, prod.application, prod.cta,
+                scene_count=prod.scene_count or 6
+            )
+        else:
+            draft = auto_script(
+                prod.topic, prod.primary_scripture,
+                prod.hook, prod.problem, prod.explanation,
+                prod.story, prod.application, prod.cta
+            )
     except RuntimeError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, f"Script drafting failed: {e}")
-    return {"id": prod.id, "draft": draft,
-            "message": "Claims & scene drafted. Review every field, edit, then submit."}
+    return {"id": prod.id, "draft": draft, "video_format": prod.video_format or "short",
+            "message": "Claims & scenes drafted. Review every field, edit, then submit."}
 
 @router.post("/productions/{prod_id}/script")
 def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db)):
+    """Submit (or resubmit after a gate failure / send-back) the script.
+    Accepts RESEARCH (first submit), SCRIPT or EVIDENCE_GATE (resubmit) —
+    resubmission replaces all existing claims and scenes."""
     prod = db.query(Production).filter(Production.id == prod_id).first()
     if not prod:
         raise HTTPException(404, "Production not found")
+    if prod.stage not in (Stage.RESEARCH, Stage.SCRIPT, Stage.EVIDENCE_GATE):
+        raise HTTPException(400, f"Expected RESEARCH/SCRIPT/EVIDENCE_GATE, got {prod.stage.value}")
+
     if prod.stage != Stage.RESEARCH:
-        raise HTTPException(400, f"Expected RESEARCH, got {prod.stage.value}")
+        # Resubmission path: wipe previous claims + scenes, reset gate state.
+        db.query(Claim).filter(Claim.production_id == prod_id).delete()
+        db.query(Scene).filter(Scene.production_id == prod_id).delete()
+        prod.evidence_gate_passed = False
+        prod.requires_manual_review = False
+        db.flush()
 
     claim_map = {}
     for i, c in enumerate(data.claims):
@@ -237,7 +283,7 @@ def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db
             interpretation=c.interpretation,
             confidence=conf_map.get(c.confidence.lower(), Confidence.MEDIUM),
             alternative_interpretations=c.alternative_interpretations or "",
-            claim_type=type_map.get(c.claim_type.lower(), ClaimType.SPECULATION),
+            claim_type=type_map.get(c.claim_type.lower(), ClaimType.SCHOLARLY),
             cross_references=c.cross_references or [],
             character_of_god_relevant=c.character_of_god_relevant or False,
             gospel_relevant=c.gospel_relevant or False,
@@ -246,11 +292,11 @@ def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db
         claim_map[i] = claim.id
 
     db.flush()
-    for s in data.scenes:
+    for i, s in enumerate(data.scenes):
         scene = Scene(
             id=str(uuid.uuid4()),
             production_id=prod_id,
-            order_index=s.get("order_index", 0),
+            order_index=s.get("order_index", i),
             narration_text=s.get("narration_text", ""),
             visual_prompt=s.get("visual_prompt", ""),
             claim_ids=[claim_map.get(idx, idx) for idx in s.get("claim_ids", [])]
@@ -259,7 +305,9 @@ def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db
 
     prod.stage = Stage.SCRIPT
     db.commit()
-    return {"id": prod.id, "stage": prod.stage.value, "claim_count": len(data.claims), "message": "Script submitted. Run evidence gate."}
+    return {"id": prod.id, "stage": prod.stage.value, "claim_count": len(data.claims),
+            "scene_count": len(data.scenes),
+            "message": "Script submitted. Run evidence gate."}
 
 @router.post("/productions/{prod_id}/evidence")
 def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
@@ -305,7 +353,7 @@ def run_evidence_gate_endpoint(prod_id: str, db: Session = Depends(get_db)):
         db.commit()
         return {"id": prod.id, "stage": prod.stage.value, "decision": "FAIL",
                 "violations": result.violations, "warnings": result.warnings,
-                "message": "Theological gate FAILED. Repair and resubmit."}
+                "message": "Theological gate FAILED. Use Send Back to edit and resubmit the script."}
 
     prod.requires_manual_review = result.requires_manual
 
@@ -352,8 +400,12 @@ def human_review(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)
         db.commit()
         return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED (human override). Ready for production."}
     else:
+        # SEND BACK: return to SCRIPT stage so the script can be edited and resubmitted.
+        # This closes the repair loop — previously a gate FAIL parked the production forever.
+        prod.stage = Stage.SCRIPT
         db.commit()
-        return {"id": prod.id, "stage": "evidence_gate", "message": f"Review: {data.decision.upper()}. Repair required."}
+        return {"id": prod.id, "stage": prod.stage.value,
+                "message": "Sent back to script stage. Edit claims/scenes and resubmit."}
 
 @router.post("/productions/{prod_id}/produce")
 def produce(prod_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
@@ -381,6 +433,8 @@ def _produce_scenes(prod_id: str):
     engine = get_engine(settings.database_url)
     db = SessionLocal(bind=engine)
     try:
+        prod = db.query(Production).filter(Production.id == prod_id).first()
+        orientation = _prod_orientation(prod)
         scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
         for scene in scenes:
             audio_ok = scene.narration_audio_path and os.path.exists(scene.narration_audio_path)
@@ -406,11 +460,11 @@ def _produce_scenes(prod_id: str):
                 out_base = f"{settings.output_dir}/visuals/{scene.id}"
                 path, provider, simulated = generate_scene_visual(
                     scene.visual_prompt or scene.narration_text or "Answers in Faith",
-                    out_base, est_dur)
+                    out_base, est_dur, orientation=orientation)
                 if simulated:
                     path = out_base + ".png"
                     _generate_placeholder_visual(
-                        scene.visual_prompt or scene.narration_text or "Answers in Faith", path)
+                        scene.visual_prompt or scene.narration_text or "Answers in Faith", path, orientation)
                     scene.generation_status = "simulated"
                     print(f"[Video] Scene {scene.id} using PLACEHOLDER visual (simulated)")
                 else:
@@ -483,9 +537,9 @@ def _openai_tts(text: str, output_path: str):
     except Exception as e:
         print(f"[TTS] OpenAI exception: {e}")
 
-def _generate_placeholder_visual(prompt: str, output_path: str):
+def _generate_placeholder_visual(prompt: str, output_path: str, orientation=None):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    W, H = _render_dims()
+    W, H = _render_dims(orientation)
     txt_file = output_path.replace(".png", ".txt")
     with open(txt_file, "w") as f:
         f.write(prompt[:120])
@@ -499,29 +553,39 @@ def _generate_placeholder_visual(prompt: str, output_path: str):
                f"color=c=0x0f172a:s={W}x{H}:d=1", "-frames:v", "1", output_path]
         subprocess.run(cmd, capture_output=True, timeout=30)
 
-def _render_dims():
-    """720x1280 vertical when VIDEO_ASPECT_RATIO=9:16 (TikTok/Shorts), else 1280x720.
+def _prod_orientation(prod):
+    """Per-production orientation; falls back to VIDEO_ASPECT_RATIO env (server default)."""
+    o = (getattr(prod, "orientation", None) or "").strip().lower()
+    if o in ("vertical", "landscape"):
+        return o
+    ar = os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip()
+    return "vertical" if ar in ("9:16", "9x16", "vertical") else "landscape"
+
+def _render_dims(orientation=None):
+    """720x1280 vertical / 1280x720 landscape.
     Vertical is 720p on purpose: small containers encode 1080x1920 at ~12fps, the
     30fps input outruns it, frames buffer unboundedly, ffmpeg gets OOM-killed (rc=-9)."""
-    ar = os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip()
-    if ar in ("9:16", "9x16", "vertical"):
+    if orientation is None:
+        ar = os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip()
+        orientation = "vertical" if ar in ("9:16", "9x16", "vertical") else "landscape"
+    if str(orientation).strip().lower() in ("vertical", "9:16", "9x16", "portrait"):
         return 720, 1280
     return 1280, 720
 
-def _render_fps():
-    return 24 if _render_dims() == (720, 1280) else 30
+def _render_fps(orientation=None):
+    return 24 if _render_dims(orientation) == (720, 1280) else 30
 
-def _render_preset():
-    return "ultrafast" if _render_dims() == (720, 1280) else "veryfast"
+def _render_preset(orientation=None):
+    return "ultrafast" if _render_dims(orientation) == (720, 1280) else "veryfast"
 
-def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
+def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str, orientation=None):
     """Motion render on a still image — output normalized for concat.
     Landscape: zoompan burst from a single frame (memory-safe at 720p).
     Vertical: crop-pan with '-re' paced input — zoompan buffers the whole burst
     and 1080x1920 x 870 frames OOMs small containers (observed: rc=-9 at frame 0)."""
-    W, H = _render_dims()
-    fps = _render_fps()
-    preset = _render_preset()
+    W, H = _render_dims(orientation)
+    fps = _render_fps(orientation)
+    preset = _render_preset(orientation)
     if (W, H) == (720, 1280):
         pw, ph = int(W * 1.15), int(H * 1.15)
         vf = (f"scale={pw}:{ph}:force_original_aspect_ratio=increase,"
@@ -559,21 +623,22 @@ def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
         result = subprocess.run(cmd_simple, capture_output=True, timeout=300)
     return result
 
-def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str):
+def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str, orientation=None):
     """Loop/trim an AI-generated clip to narration length — normalized for concat.
     '-re' paces the looped input at realtime so frames can't buffer unboundedly (OOM guard)."""
-    W, H = _render_dims()
-    vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={_render_fps()},format=yuv420p"
+    W, H = _render_dims(orientation)
+    vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={_render_fps(orientation)},format=yuv420p"
     cmd = [
         settings.ffmpeg_path, "-y", "-re", "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path, "-map", "0:v", "-map", "1:a", "-vf", vf,
-        "-c:v", "libx264", "-preset", _render_preset(), "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-c:v", "libx264", "-preset", _render_preset(orientation), "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-t", str(dur), clip
     ]
     return subprocess.run(cmd, capture_output=True, timeout=300)
 
 def _assemble_video(prod_id: str, db: Session):
     prod = db.query(Production).filter(Production.id == prod_id).first()
+    orientation = _prod_orientation(prod)
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
     if not scenes:
         _fail_production(db, prod_id, "No scenes to assemble")
@@ -597,9 +662,9 @@ def _assemble_video(prod_id: str, db: Session):
         clip = f"{settings.output_dir}/final/{scene.id}_clip.mp4"
         try:
             if scene.visual_path.lower().endswith(".mp4"):
-                result = _clip_from_video(scene.visual_path, scene.narration_audio_path, dur, clip)
+                result = _clip_from_video(scene.visual_path, scene.narration_audio_path, dur, clip, orientation)
             else:
-                result = _clip_from_image(scene.visual_path, scene.narration_audio_path, dur, clip)
+                result = _clip_from_image(scene.visual_path, scene.narration_audio_path, dur, clip, orientation)
             if result.returncode == 0 and os.path.exists(clip):
                 scene_list.append(clip)
             else:
@@ -754,8 +819,12 @@ def quality_gate(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)
         db.commit()
         return {"id": prod.id, "stage": prod.stage.value, "message": "Quality passed. Submit packaging."}
     else:
+        # NEEDS REPAIR: send back to HUMAN_REVIEW so production can be re-run
+        # (previously a failed quality gate parked the production forever).
+        prod.stage = Stage.HUMAN_REVIEW
         db.commit()
-        return {"id": prod.id, "message": "Quality check failed. Repair scenes."}
+        return {"id": prod.id, "stage": prod.stage.value,
+                "message": "Sent back for repair. Fix scenes if needed, then re-run Start Production."}
 
 @router.post("/productions/{prod_id}/packaging")
 def submit_packaging(prod_id: str, data: PackagingSubmit, db: Session = Depends(get_db)):
@@ -811,6 +880,10 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         "doctrinal_category": prod.doctrinal_category.value,
         "primary_scripture": prod.primary_scripture,
         "gospel_video": prod.gospel_video,
+        "video_format": getattr(prod, "video_format", None) or "short",
+        "orientation": getattr(prod, "orientation", None),
+        "effective_orientation": _prod_orientation(prod),
+        "scene_count": getattr(prod, "scene_count", None),
         "evidence_gate_passed": prod.evidence_gate_passed,
         "human_review_passed": prod.human_review_passed,
         "quality_gate_passed": prod.quality_gate_passed,
@@ -833,6 +906,7 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
                     "confidence": c.confidence.value, "type": c.claim_type.value,
                     "source_reference": c.source_reference,
                     "source_text": c.source_text,
+                    "original_language": c.original_language,
                     "context": c.context,
                     "interpretation": c.interpretation,
                     "cross_references": c.cross_references,
@@ -861,6 +935,8 @@ def list_productions(stage: Optional[str] = None, db: Session = Depends(get_db))
              "status": p.status,
              "doctrinal_category": p.doctrinal_category.value,
              "primary_scripture": p.primary_scripture,
+             "video_format": getattr(p, "video_format", None) or "short",
+             "orientation": getattr(p, "orientation", None),
              "created_at": p.created_at} for p in prods]
 
 @router.delete("/productions/{prod_id}")
