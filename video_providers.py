@@ -2,6 +2,8 @@
 # Ported from Lumen (youtube-automation-agent) utils/video-providers.js
 # Chain: Seedance (Replicate, real AI video clip) -> OpenAI image (real AI still,
 # Ken Burns motion applied at assembly) -> placeholder (flagged SIMULATED).
+# Orientation is PER-PRODUCTION now: "vertical" (9:16) / "landscape" (16:9),
+# falling back to the server-wide VIDEO_ASPECT_RATIO env var when not set.
 import os
 import time
 import requests
@@ -24,9 +26,16 @@ def provider_status() -> dict:
     }
 
 
+def _is_vertical(orientation=None) -> bool:
+    """orientation: 'vertical' / 'landscape' / None (-> VIDEO_ASPECT_RATIO env)."""
+    if orientation:
+        return str(orientation).strip().lower() in ("vertical", "9:16", "9x16")
+    return os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip() in ("9:16", "9x16", "vertical")
+
+
 # ---------- Seedance via Replicate (real video clip) ----------
 
-def _seedance_clip(prompt: str, output_path: str, duration: float) -> bool:
+def _seedance_clip(prompt: str, output_path: str, duration: float, orientation=None) -> bool:
     token = os.getenv("REPLICATE_API_TOKEN") or os.getenv("REPLICATE_API_KEY")
     if not token:
         return False
@@ -41,7 +50,7 @@ def _seedance_clip(prompt: str, output_path: str, duration: float) -> bool:
                 "prompt": prompt[:1900],
                 "duration": clip_seconds,
                 "resolution": os.getenv("VIDEO_RESOLUTION", "720p"),
-                "aspect_ratio": os.getenv("VIDEO_ASPECT_RATIO", "16:9"),
+                "aspect_ratio": "9:16" if _is_vertical(orientation) else "16:9",
                 "output_format": "mp4",
             },
         )
@@ -83,18 +92,16 @@ def _seedance_clip(prompt: str, output_path: str, duration: float) -> bool:
         return False
 
 
-def _vertical() -> bool:
-    return os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip() in ("9:16", "9x16", "vertical")
-
 # ---------- OpenAI image (real AI still; Ken Burns at assembly) ----------
 
-def _openai_image(prompt: str, output_path: str) -> bool:
+def _openai_image(prompt: str, output_path: str, orientation=None) -> bool:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         return False
     try:
-        aspect = "9:16 vertical" if _vertical() else "16:9"
-        size = "1024x1536" if _vertical() else "1536x1024"
+        vertical = _is_vertical(orientation)
+        aspect = "9:16 vertical" if vertical else "16:9"
+        size = "1024x1536" if vertical else "1536x1024"
         r = requests.post(
             "https://api.openai.com/v1/images/generations",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -129,11 +136,12 @@ def _openai_image(prompt: str, output_path: str) -> bool:
 
 # ---------- Public entry ----------
 
-def generate_scene_visual(prompt: str, out_base: str, duration: float):
+def generate_scene_visual(prompt: str, out_base: str, duration: float, orientation=None):
     """
     Try providers in VIDEO_PROVIDER_ORDER.
     Returns (file_path, provider_id, simulated_bool).
     out_base has no extension; extension depends on provider (.mp4 clip or .png still).
+    orientation: 'vertical' / 'landscape' / None (-> env VIDEO_ASPECT_RATIO).
     """
     prompt = (prompt or "Answers in Faith").strip()
     order = [p.strip() for p in os.getenv(
@@ -142,11 +150,11 @@ def generate_scene_visual(prompt: str, out_base: str, duration: float):
     for provider in order:
         if provider == "seedance":
             path = out_base + ".mp4"
-            if _seedance_clip(prompt, path, duration):
+            if _seedance_clip(prompt, path, duration, orientation):
                 return path, "seedance", False
         elif provider in ("openai_image", "image"):
             path = out_base + ".png"
-            if _openai_image(prompt, path):
+            if _openai_image(prompt, path, orientation):
                 return path, "openai_image", False
         elif provider == "placeholder":
             break  # handled by caller (pipeline._generate_placeholder_visual)
