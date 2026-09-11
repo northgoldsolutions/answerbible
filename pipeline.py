@@ -555,7 +555,7 @@ def _generate_placeholder_visual(prompt: str, output_path: str, orientation=None
         f.write(prompt[:120])
     cmd = [settings.ffmpeg_path, "-y", "-f", "lavfi", "-i",
            f"color=c=0x0f172a:s={W}x{H}:d=1", "-vf",
-           f"drawtext=textfile='{txt_file}':fontcolor=white:fontsize=28:x=(w-text_h)/2:y=(h-text_h)/2",
+           f"drawtext=textfile='{txt_file}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=(h-text_h)/2",
            "-frames:v", "1", output_path]
     result = subprocess.run(cmd, capture_output=True, timeout=30)
     if result.returncode != 0 or not os.path.exists(output_path):
