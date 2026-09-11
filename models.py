@@ -86,6 +86,13 @@ class Production(Base):
     orientation = Column(String)
     scene_count = Column(Integer)
 
+    # Art-form controls
+    # visual_style: "cinematic" (dark scholarly look) or "animated" (3D Pixar-style);
+    #   None = cinematic default
+    # burn_captions: burn big word-by-word captions into the video (Shorts style)
+    visual_style = Column(String)
+    burn_captions = Column(Boolean, default=False)
+
     # Theological metadata
     primary_scripture = Column(String)
     doctrinal_category = Column(Enum(DoctrinalCategory), default=DoctrinalCategory.GENERAL)
@@ -186,6 +193,8 @@ def init_db(engine):
             ('video_format', 'VARCHAR'),
             ('orientation', 'VARCHAR'),
             ('scene_count', 'INTEGER'),
+            ('visual_style', 'VARCHAR'),
+            ('burn_captions', 'BOOLEAN'),
         ]
         for col, col_type in migrations:
             if col not in columns:
