@@ -75,6 +75,9 @@ class ProductionCreate(BaseModel):
     orientation: Optional[str] = None      # "vertical" | "landscape" | None (-> env default)
     video_format: Optional[str] = "short"  # "short" | "episode"
     scene_count: Optional[int] = None      # target scenes for episode auto-script (4-10)
+    # Art-form build: per-production visual style + burned captions
+    visual_style: Optional[str] = None     # "animated" | "cinematic" | None
+    burn_captions: Optional[bool] = False  # burn big word-by-word captions into the video
 
 class ResearchSubmit(BaseModel):
     hook: str
@@ -146,6 +149,9 @@ def create_production(data: ProductionCreate, db: Session = Depends(get_db)):
     scene_count = None
     if video_format == "episode":
         scene_count = max(4, min(10, int(data.scene_count or 6)))
+    visual_style = (data.visual_style or "").strip().lower() or None
+    if visual_style not in ("animated", "cinematic"):
+        visual_style = None
     prod = Production(
         id=str(uuid.uuid4()),
         topic=data.topic,
@@ -157,13 +163,16 @@ def create_production(data: ProductionCreate, db: Session = Depends(get_db)):
         supporting_passages=data.supporting_passages or [],
         video_format=video_format,
         orientation=_normalize_orientation(data.orientation),
-        scene_count=scene_count
+        scene_count=scene_count,
+        visual_style=visual_style,
+        burn_captions=bool(data.burn_captions)
     )
     db.add(prod)
     db.commit()
     db.refresh(prod)
     return {"id": prod.id, "stage": prod.stage.value,
             "video_format": prod.video_format, "orientation": prod.orientation,
+            "visual_style": prod.visual_style, "burn_captions": bool(prod.burn_captions),
             "message": "Production created. Submit research."}
 
 @router.post("/productions/{prod_id}/research")
@@ -460,7 +469,8 @@ def _produce_scenes(prod_id: str):
                 out_base = f"{settings.output_dir}/visuals/{scene.id}"
                 path, provider, simulated = generate_scene_visual(
                     scene.visual_prompt or scene.narration_text or "Answers in Faith",
-                    out_base, est_dur, orientation=orientation)
+                    out_base, est_dur, orientation=orientation,
+                    style=getattr(prod, "visual_style", None))
                 if simulated:
                     path = out_base + ".png"
                     _generate_placeholder_visual(
@@ -545,7 +555,7 @@ def _generate_placeholder_visual(prompt: str, output_path: str, orientation=None
         f.write(prompt[:120])
     cmd = [settings.ffmpeg_path, "-y", "-f", "lavfi", "-i",
            f"color=c=0x0f172a:s={W}x{H}:d=1", "-vf",
-           f"drawtext=textfile='{txt_file}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=(h-text_h)/2",
+           f"drawtext=textfile='{txt_file}':fontcolor=white:fontsize=28:x=(w-text_h)/2:y=(h-text_h)/2",
            "-frames:v", "1", output_path]
     result = subprocess.run(cmd, capture_output=True, timeout=30)
     if result.returncode != 0 or not os.path.exists(output_path):
@@ -696,6 +706,12 @@ def _assemble_video(prod_id: str, db: Session):
         return
 
     print(f"[Assembly] SUCCESS: {final_output}")
+
+    # Art-form build: burn big word-by-word captions before upload (optional per production).
+    # Failure is non-fatal — we upload the uncaptioned video rather than fail the run.
+    if getattr(prod, "burn_captions", False):
+        _burn_captions(prod_id, scenes, orientation, final_output)
+
     try:
         public_url = upload_video(prod_id, final_output)
         prod.video_url = public_url
@@ -767,6 +783,97 @@ def _write_captions(prod_id: str, scenes) -> Optional[str]:
         f.write("\n".join(blocks))
     print(f"[Captions] Wrote {srt_path} ({idx - 1} blocks)")
     return srt_path
+
+def _write_ass(prod_id: str, scenes, orientation=None) -> Optional[str]:
+    """Generate an ASS subtitle file with BIG word-by-word captions (Shorts art form).
+    One Dialogue event per word: uppercase, white fill, heavy black outline,
+    lower-center. Each scene's audio duration is split evenly across its words."""
+    import re as _re
+    W, H = _render_dims(orientation)
+    font_size = 84 if (W, H) == (720, 1280) else 64
+    margin_v = int(H * 0.18)
+
+    def ts(seconds: float) -> str:
+        if seconds < 0:
+            seconds = 0.0
+        h = int(seconds // 3600); m = int((seconds % 3600) // 60)
+        s = int(seconds % 60); cs = int(round((seconds % 1) * 100))
+        if cs == 100:
+            s += 1; cs = 0
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+    events = []
+    cursor = 0.0
+    for scene in scenes:
+        text = (scene.narration_text or "").strip()
+        if not text:
+            continue
+        dur = 5.0
+        if scene.narration_audio_path and os.path.exists(scene.narration_audio_path):
+            d = _get_audio_duration(scene.narration_audio_path)
+            if d > 0:
+                dur = min(d, float(settings.max_scene_duration))
+        words = [w for w in (_re.sub(r"[^A-Za-z0-9'’\-]", "", w) for w in text.split()) if w]
+        if not words:
+            cursor += dur
+            continue
+        per = dur / len(words)
+        t = cursor
+        for w in words:
+            events.append(f"Dialogue: 0,{ts(t)},{ts(t + per)},Cap,,0,0,0,,{w.upper()}")
+            t += per
+        cursor += dur
+
+    if not events:
+        return None
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {W}\n"
+        f"PlayResY: {H}\n"
+        "ScaledBorderAndShadow: yes\n"
+        "\n[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Cap,DejaVu Sans,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+        f"1,0,0,0,100,100,0,0,1,6,2,2,30,30,{margin_v},1\n"
+        "\n[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+    out_dir = f"{settings.output_dir}/captions"
+    os.makedirs(out_dir, exist_ok=True)
+    ass_path = f"{out_dir}/{prod_id}.ass"
+    with open(ass_path, "w") as f:
+        f.write(header + "\n".join(events) + "\n")
+    print(f"[Captions] Wrote ASS {ass_path} ({len(events)} word events)")
+    return ass_path
+
+def _burn_captions(prod_id: str, scenes, orientation, final_output: str) -> bool:
+    """Burn the word-by-word ASS captions into the final video. On any failure the
+    uncaptioned video is kept — burn-in never fails the production."""
+    try:
+        ass_path = _write_ass(prod_id, scenes, orientation)
+        if not ass_path:
+            print(f"[Captions] No caption events for {prod_id}, skipping burn-in")
+            return False
+        ass_rel = os.path.relpath(ass_path)  # the ass filter mishandles some absolute paths
+        burned = f"{settings.output_dir}/final/{prod_id}_cap.mp4"
+        cmd = [
+            settings.ffmpeg_path, "-y", "-i", final_output,
+            "-vf", f"ass={ass_rel}",
+            "-c:v", "libx264", "-preset", _render_preset(orientation), "-threads", "2",
+            "-c:a", "copy", burned
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode == 0 and os.path.exists(burned) and os.path.getsize(burned) > 0:
+            os.replace(burned, final_output)
+            print(f"[Captions] Burned word-by-word captions into {final_output}")
+            return True
+        print(f"[Captions] Burn-in failed rc={result.returncode}: {result.stderr.decode()[-260:]}")
+    except Exception as e:
+        print(f"[Captions] Burn-in exception: {e}")
+    return False
 
 def _get_audio_duration(path: str) -> float:
     import re
@@ -884,6 +991,8 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         "orientation": getattr(prod, "orientation", None),
         "effective_orientation": _prod_orientation(prod),
         "scene_count": getattr(prod, "scene_count", None),
+        "visual_style": getattr(prod, "visual_style", None),
+        "burn_captions": bool(getattr(prod, "burn_captions", False)),
         "evidence_gate_passed": prod.evidence_gate_passed,
         "human_review_passed": prod.human_review_passed,
         "quality_gate_passed": prod.quality_gate_passed,
@@ -937,6 +1046,8 @@ def list_productions(stage: Optional[str] = None, db: Session = Depends(get_db))
              "primary_scripture": p.primary_scripture,
              "video_format": getattr(p, "video_format", None) or "short",
              "orientation": getattr(p, "orientation", None),
+             "visual_style": getattr(p, "visual_style", None),
+             "burn_captions": bool(getattr(p, "burn_captions", False)),
              "created_at": p.created_at} for p in prods]
 
 @router.delete("/productions/{prod_id}")
