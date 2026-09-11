@@ -4,9 +4,21 @@
 # Ken Burns motion applied at assembly) -> placeholder (flagged SIMULATED).
 # Orientation is PER-PRODUCTION now: "vertical" (9:16) / "landscape" (16:9),
 # falling back to the server-wide VIDEO_ASPECT_RATIO env var when not set.
+# Visual style is PER-PRODUCTION too: "cinematic" (default dark scholarly look)
+# or "animated" (3D animated-movie / Pixar-style, warm golden light).
 import os
 import time
 import requests
+
+# Style descriptors prepended to every visual prompt.
+STYLE_PREFIXES = {
+    "animated": ("3D animated film still in the style of a modern animated family movie, "
+                 "expressive stylized 3D characters with large eyes and soft rounded features, "
+                 "warm golden-hour lighting, shallow depth of field, softly blurred background, "
+                 "vibrant but warm color grade, high detail render"),
+    "cinematic": "cinematic, ethereal",
+}
+DEFAULT_STYLE = "cinematic"
 
 
 def _redact(msg: str) -> str:
@@ -33,9 +45,14 @@ def _is_vertical(orientation=None) -> bool:
     return os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip() in ("9:16", "9x16", "vertical")
 
 
+def _style_prefix(style=None) -> str:
+    s = (style or "").strip().lower()
+    return STYLE_PREFIXES.get(s, STYLE_PREFIXES[DEFAULT_STYLE])
+
+
 # ---------- Seedance via Replicate (real video clip) ----------
 
-def _seedance_clip(prompt: str, output_path: str, duration: float, orientation=None) -> bool:
+def _seedance_clip(prompt: str, output_path: str, duration: float, orientation=None, style=None) -> bool:
     token = os.getenv("REPLICATE_API_TOKEN") or os.getenv("REPLICATE_API_KEY")
     if not token:
         return False
@@ -47,7 +64,7 @@ def _seedance_clip(prompt: str, output_path: str, duration: float, orientation=N
         prediction = client.predictions.create(
             model=model,
             input={
-                "prompt": prompt[:1900],
+                "prompt": f"{_style_prefix(style)}: {prompt}"[:1900],
                 "duration": clip_seconds,
                 "resolution": os.getenv("VIDEO_RESOLUTION", "720p"),
                 "aspect_ratio": "9:16" if _is_vertical(orientation) else "16:9",
@@ -94,7 +111,7 @@ def _seedance_clip(prompt: str, output_path: str, duration: float, orientation=N
 
 # ---------- OpenAI image (real AI still; Ken Burns at assembly) ----------
 
-def _openai_image(prompt: str, output_path: str, orientation=None) -> bool:
+def _openai_image(prompt: str, output_path: str, orientation=None, style=None) -> bool:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         return False
@@ -107,7 +124,7 @@ def _openai_image(prompt: str, output_path: str, orientation=None) -> bool:
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={
                 "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1"),
-                "prompt": f"cinematic, ethereal, {aspect} video background frame: {prompt}"[:3900],
+                "prompt": f"{_style_prefix(style)}, {aspect} video background frame: {prompt}"[:3900],
                 "size": size,
                 "n": 1,
             },
@@ -136,12 +153,13 @@ def _openai_image(prompt: str, output_path: str, orientation=None) -> bool:
 
 # ---------- Public entry ----------
 
-def generate_scene_visual(prompt: str, out_base: str, duration: float, orientation=None):
+def generate_scene_visual(prompt: str, out_base: str, duration: float, orientation=None, style=None):
     """
     Try providers in VIDEO_PROVIDER_ORDER.
     Returns (file_path, provider_id, simulated_bool).
     out_base has no extension; extension depends on provider (.mp4 clip or .png still).
     orientation: 'vertical' / 'landscape' / None (-> env VIDEO_ASPECT_RATIO).
+    style: 'animated' / 'cinematic' / None (-> cinematic).
     """
     prompt = (prompt or "Answers in Faith").strip()
     order = [p.strip() for p in os.getenv(
@@ -150,11 +168,11 @@ def generate_scene_visual(prompt: str, out_base: str, duration: float, orientati
     for provider in order:
         if provider == "seedance":
             path = out_base + ".mp4"
-            if _seedance_clip(prompt, path, duration, orientation):
+            if _seedance_clip(prompt, path, duration, orientation, style):
                 return path, "seedance", False
         elif provider in ("openai_image", "image"):
             path = out_base + ".png"
-            if _openai_image(prompt, path, orientation):
+            if _openai_image(prompt, path, orientation, style):
                 return path, "openai_image", False
         elif provider == "placeholder":
             break  # handled by caller (pipeline._generate_placeholder_visual)
