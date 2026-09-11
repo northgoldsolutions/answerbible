@@ -83,6 +83,9 @@ def _seedance_clip(prompt: str, output_path: str, duration: float) -> bool:
         return False
 
 
+def _vertical() -> bool:
+    return os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip() in ("9:16", "9x16", "vertical")
+
 # ---------- OpenAI image (real AI still; Ken Burns at assembly) ----------
 
 def _openai_image(prompt: str, output_path: str) -> bool:
@@ -90,13 +93,15 @@ def _openai_image(prompt: str, output_path: str) -> bool:
     if not key:
         return False
     try:
+        aspect = "9:16 vertical" if _vertical() else "16:9"
+        size = "1024x1536" if _vertical() else "1536x1024"
         r = requests.post(
             "https://api.openai.com/v1/images/generations",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json={
                 "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1"),
-                "prompt": f"cinematic, ethereal, 16:9 video background frame: {prompt}"[:3900],
-                "size": "1536x1024",
+                "prompt": f"cinematic, ethereal, {aspect} video background frame: {prompt}"[:3900],
+                "size": size,
                 "n": 1,
             },
             timeout=120,
