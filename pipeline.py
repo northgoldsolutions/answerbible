@@ -446,8 +446,13 @@ def _produce_scenes(prod_id: str):
         orientation = _prod_orientation(prod)
         scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
         for scene in scenes:
-            audio_ok = scene.narration_audio_path and os.path.exists(scene.narration_audio_path)
-            visual_ok = scene.visual_path and os.path.exists(scene.visual_path)
+            # Simulated (placeholder) visuals and silent-fallback audio are STALE:
+            # they must regenerate on re-run once a real provider is fixed.
+            silent_marker = (scene.narration_audio_path or "") + ".silent"
+            audio_ok = (scene.narration_audio_path and os.path.exists(scene.narration_audio_path)
+                        and not os.path.exists(silent_marker))
+            visual_ok = (scene.visual_path and os.path.exists(scene.visual_path)
+                         and scene.generation_status != "simulated")
             if scene.is_locked and audio_ok and visual_ok:
                 continue
             if not audio_ok:
@@ -461,7 +466,10 @@ def _produce_scenes(prod_id: str):
                 if not ok:
                     est = max(3.0, min(float(settings.max_scene_duration), len(scene.narration_text or "") * 0.06))
                     _silent_audio(audio_path, est)
+                    open(audio_path + ".silent", "w").write("1")
                     print(f"[TTS] No voice generated for scene {scene.id}, using silent track")
+                elif os.path.exists(audio_path + ".silent"):
+                    os.remove(audio_path + ".silent")
                 scene.narration_audio_path = audio_path
             if not visual_ok:
                 est_dur = max(3.0, min(float(settings.max_scene_duration),
