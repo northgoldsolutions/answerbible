@@ -500,11 +500,19 @@ def _generate_placeholder_visual(prompt: str, output_path: str):
         subprocess.run(cmd, capture_output=True, timeout=30)
 
 def _render_dims():
-    """1080x1920 vertical when VIDEO_ASPECT_RATIO=9:16 (TikTok/Shorts), else 1280x720."""
+    """720x1280 vertical when VIDEO_ASPECT_RATIO=9:16 (TikTok/Shorts), else 1280x720.
+    Vertical is 720p on purpose: small containers encode 1080x1920 at ~12fps, the
+    30fps input outruns it, frames buffer unboundedly, ffmpeg gets OOM-killed (rc=-9)."""
     ar = os.getenv("VIDEO_ASPECT_RATIO", "16:9").strip()
     if ar in ("9:16", "9x16", "vertical"):
-        return 1080, 1920
+        return 720, 1280
     return 1280, 720
+
+def _render_fps():
+    return 24 if _render_dims() == (720, 1280) else 30
+
+def _render_preset():
+    return "ultrafast" if _render_dims() == (720, 1280) else "veryfast"
 
 def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
     """Motion render on a still image — output normalized for concat.
@@ -512,38 +520,40 @@ def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
     Vertical: crop-pan with '-re' paced input — zoompan buffers the whole burst
     and 1080x1920 x 870 frames OOMs small containers (observed: rc=-9 at frame 0)."""
     W, H = _render_dims()
-    if (W, H) == (1080, 1920):
+    fps = _render_fps()
+    preset = _render_preset()
+    if (W, H) == (720, 1280):
         pw, ph = int(W * 1.15), int(H * 1.15)
         vf = (f"scale={pw}:{ph}:force_original_aspect_ratio=increase,"
               f"crop={W}:{H}:x='(iw-{W})/2':y='(ih-{H})*min(t/{max(dur, 0.1)},1)',"
-              f"fps=30,format=yuv420p")
+              f"fps={fps},format=yuv420p")
         cmd = [
-            settings.ffmpeg_path, "-y", "-re", "-loop", "1", "-framerate", "30", "-i", image_path,
+            settings.ffmpeg_path, "-y", "-re", "-loop", "1", "-framerate", str(fps), "-i", image_path,
             "-i", audio_path, "-vf", vf,
-            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+            "-c:v", "libx264", "-preset", preset, "-threads", "2",
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
             "-t", str(dur), "-shortest", clip
         ]
     else:
         ow, oh = int(W * 1.25), int(H * 1.25)
-        frames = max(1, int(dur * 30))
+        frames = max(1, int(dur * fps))
         vf = (f"scale={ow}:{oh}:force_original_aspect_ratio=increase,crop={ow}:{oh},"
               f"zoompan=z='1+0.15*on/{frames}':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-              f"s={W}x{H}:fps=30,format=yuv420p")
+              f"s={W}x{H}:fps={fps},format=yuv420p")
         cmd = [
             settings.ffmpeg_path, "-y", "-i", image_path,
             "-i", audio_path, "-vf", vf,
-            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-c:v", "libx264", "-preset", preset, "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
             "-t", str(dur), clip
         ]
     result = subprocess.run(cmd, capture_output=True, timeout=300)
     if result.returncode != 0 or not os.path.exists(clip):
         print(f"[Assembly] Motion render failed, retrying static. Tail: {result.stderr.decode()[-200:]}")
-        vf_simple = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30,format=yuv420p"
+        vf_simple = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={fps},format=yuv420p"
         cmd_simple = [
-            settings.ffmpeg_path, "-y", "-re", "-loop", "1", "-framerate", "30", "-i", image_path,
+            settings.ffmpeg_path, "-y", "-re", "-loop", "1", "-framerate", str(fps), "-i", image_path,
             "-i", audio_path, "-vf", vf_simple,
-            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-c:v", "libx264", "-preset", preset, "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
             "-t", str(dur), "-shortest", clip
         ]
         result = subprocess.run(cmd_simple, capture_output=True, timeout=300)
@@ -553,11 +563,11 @@ def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str):
     """Loop/trim an AI-generated clip to narration length — normalized for concat.
     '-re' paces the looped input at realtime so frames can't buffer unboundedly (OOM guard)."""
     W, H = _render_dims()
-    vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30,format=yuv420p"
+    vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={_render_fps()},format=yuv420p"
     cmd = [
         settings.ffmpeg_path, "-y", "-re", "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path, "-map", "0:v", "-map", "1:a", "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-c:v", "libx264", "-preset", _render_preset(), "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-t", str(dur), clip
     ]
     return subprocess.run(cmd, capture_output=True, timeout=300)
