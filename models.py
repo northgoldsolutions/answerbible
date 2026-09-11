@@ -77,6 +77,15 @@ class Production(Base):
     keywords = Column(Text)
     youtube_video_id = Column(String)
 
+    # Per-production format controls (long-form build)
+    # video_format: "short" (single scene, ~30s) or "episode" (multi-scene, ~4-8 min)
+    # orientation: "vertical" (9:16 TikTok/Shorts) or "landscape" (16:9 YouTube)
+    #   None means "fall back to the server-wide VIDEO_ASPECT_RATIO env var"
+    # scene_count: target number of scenes for episode auto-script (5-10)
+    video_format = Column(String, default="short")
+    orientation = Column(String)
+    scene_count = Column(Integer)
+
     # Theological metadata
     primary_scripture = Column(String)
     doctrinal_category = Column(Enum(DoctrinalCategory), default=DoctrinalCategory.GENERAL)
@@ -164,15 +173,25 @@ def get_engine(db_url=None):
 
 def init_db(engine):
     Base.metadata.create_all(bind=engine)
-    # Migration: add media URL columns if missing
+    # Migrations: add columns to the EXISTING productions table if missing.
+    # create_all() never alters existing tables, so without this the new
+    # long-form columns would 500 every request against the old Postgres table.
     from sqlalchemy import inspect, text
     inspector = inspect(engine)
     if 'productions' in inspector.get_table_names():
         columns = [c['name'] for c in inspector.get_columns('productions')]
-        for col in ('video_url', 'captions_url'):
+        migrations = [
+            ('video_url', 'VARCHAR'),
+            ('captions_url', 'VARCHAR'),
+            ('video_format', 'VARCHAR'),
+            ('orientation', 'VARCHAR'),
+            ('scene_count', 'INTEGER'),
+        ]
+        for col, col_type in migrations:
             if col not in columns:
                 with engine.connect() as conn:
-                    conn.execute(text(f"ALTER TABLE productions ADD COLUMN {col} VARCHAR"))
+                    conn.execute(text(f"ALTER TABLE productions ADD COLUMN {col} {col_type}"))
                     conn.commit()
+                print(f"[Migration] Added column productions.{col}")
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False)
