@@ -507,33 +507,46 @@ def _render_dims():
     return 1280, 720
 
 def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
-    """Ken Burns pan/zoom on a still image — output normalized for concat.
-    Memory-safe: zoompan generates ALL frames from a single input frame (d=frames),
-    no '-loop 1' — a looped source outruns the encoder, buffers frames unboundedly,
-    and gets ffmpeg OOM-killed on small containers (observed: rc=-9 / SIGKILL)."""
+    """Motion render on a still image — output normalized for concat.
+    Landscape: zoompan burst from a single frame (memory-safe at 720p).
+    Vertical: crop-pan with '-re' paced input — zoompan buffers the whole burst
+    and 1080x1920 x 870 frames OOMs small containers (observed: rc=-9 at frame 0)."""
     W, H = _render_dims()
-    ow, oh = int(W * 1.25), int(H * 1.25)
-    frames = max(1, int(dur * 30))
-    vf = (f"scale={ow}:{oh}:force_original_aspect_ratio=increase,crop={ow}:{oh},"
-          f"zoompan=z='1+0.15*on/{frames}':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-          f"s={W}x{H}:fps=30,format=yuv420p")
-    cmd = [
-        settings.ffmpeg_path, "-y", "-i", image_path,
-        "-i", audio_path, "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-t", str(dur), clip
-    ]
-    result = subprocess.run(cmd, capture_output=True, timeout=180)
+    if (W, H) == (1080, 1920):
+        pw, ph = int(W * 1.15), int(H * 1.15)
+        vf = (f"scale={pw}:{ph}:force_original_aspect_ratio=increase,"
+              f"crop={W}:{H}:x='(iw-{W})/2':y='(ih-{H})*min(t/{max(dur, 0.1)},1)',"
+              f"fps=30,format=yuv420p")
+        cmd = [
+            settings.ffmpeg_path, "-y", "-re", "-loop", "1", "-framerate", "30", "-i", image_path,
+            "-i", audio_path, "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-t", str(dur), "-shortest", clip
+        ]
+    else:
+        ow, oh = int(W * 1.25), int(H * 1.25)
+        frames = max(1, int(dur * 30))
+        vf = (f"scale={ow}:{oh}:force_original_aspect_ratio=increase,crop={ow}:{oh},"
+              f"zoompan=z='1+0.15*on/{frames}':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+              f"s={W}x{H}:fps=30,format=yuv420p")
+        cmd = [
+            settings.ffmpeg_path, "-y", "-i", image_path,
+            "-i", audio_path, "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-t", str(dur), clip
+        ]
+    result = subprocess.run(cmd, capture_output=True, timeout=300)
     if result.returncode != 0 or not os.path.exists(clip):
-        print(f"[Assembly] Ken Burns render failed, retrying static. Tail: {result.stderr.decode()[-200:]}")
+        print(f"[Assembly] Motion render failed, retrying static. Tail: {result.stderr.decode()[-200:]}")
         vf_simple = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30,format=yuv420p"
         cmd_simple = [
             settings.ffmpeg_path, "-y", "-re", "-loop", "1", "-framerate", "30", "-i", image_path,
             "-i", audio_path, "-vf", vf_simple,
-            "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
             "-t", str(dur), "-shortest", clip
         ]
-        result = subprocess.run(cmd_simple, capture_output=True, timeout=180)
+        result = subprocess.run(cmd_simple, capture_output=True, timeout=300)
     return result
 
 def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str):
@@ -544,10 +557,10 @@ def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str):
     cmd = [
         settings.ffmpeg_path, "-y", "-re", "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path, "-map", "0:v", "-map", "1:a", "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-t", str(dur), clip
     ]
-    return subprocess.run(cmd, capture_output=True, timeout=180)
+    return subprocess.run(cmd, capture_output=True, timeout=300)
 
 def _assemble_video(prod_id: str, db: Session):
     prod = db.query(Production).filter(Production.id == prod_id).first()
