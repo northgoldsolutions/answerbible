@@ -54,6 +54,11 @@ def _redact(msg) -> str:
     return msg[:400]
 
 
+def _pika_base() -> str:
+    """Env values pasted from mobile often carry a trailing newline — strip it."""
+    return (settings.pika_api_url or "https://api.dev.pika.art").strip().rstrip("/")
+
+
 # ============ ENDPOINTS ============
 
 @router.post("/episodes")
@@ -167,7 +172,7 @@ def pika_check():
     key = (settings.pika_api_key or "").strip()
     if not key:
         return {"ok": False, "reason": "PIKA_API_KEY not set on server"}
-    base = (settings.pika_api_url or "https://api.dev.pika.art").rstrip("/")
+    base = _pika_base()
     headers = {"X-API-Key": key}
     out = {"base_url": base, "key_prefix": key[:7] + "...", "checks": {}}
     for path in ("/v1/billing/balance", "/billing/balance"):
@@ -322,7 +327,7 @@ def _pika_video(prompt: str, out_path: str, duration: float,
     key = (settings.pika_api_key or "").strip()
     if not key:
         return {"ok": False, "reason": "PIKA_API_KEY not set"}
-    base = (settings.pika_api_url or "https://api.dev.pika.art").rstrip("/")
+    base = _pika_base()
     model_path = os.getenv("PIKA_GENERATE_PATH") or (
         "/v1/media/pika/pika-2.5/image-to-video" if image_url
         else "/v1/media/pika/pika-2.5/text-to-video")
