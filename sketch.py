@@ -17,6 +17,8 @@
 #   GET  /sketch/episodes/{id}/download    -> get video URL (R2 or local file)
 #   DELETE /sketch/episodes/{id}           -> remove episode
 #   GET  /sketch/pika-check                -> Pika key/base-URL diagnostic
+#   GET  /sketch/voices                    -> list ElevenLabs account voices
+#   GET  /sketch/episodes/{id}/voice-check -> resolve locked voices to names
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -184,6 +186,51 @@ def pika_check():
     ok = any(c.get("status") == 200 for c in out["checks"].values())
     out["ok"] = ok
     return out
+
+
+@router.get("/voices")
+def list_voices():
+    """List every ElevenLabs voice on this account (name + id + labels) so
+    voice IDs can be verified/picked from a phone."""
+    if not settings.elevenlabs_api_key:
+        return {"ok": False, "reason": "ELEVENLABS_API_KEY not set"}
+    try:
+        r = requests.get("https://api.elevenlabs.io/v1/voices",
+                         headers={"xi-api-key": settings.elevenlabs_api_key}, timeout=30)
+        if r.status_code != 200:
+            return {"ok": False, "status": r.status_code, "body": _redact(r.text[:200])}
+        voices = [{"name": v.get("name"), "voice_id": v.get("voice_id"),
+                   "category": v.get("category"), "labels": v.get("labels")}
+                  for v in r.json().get("voices", [])]
+        return {"ok": True, "count": len(voices), "voices": voices}
+    except Exception as e:
+        return {"ok": False, "reason": _redact(e)}
+
+
+@router.get("/episodes/{ep_id}/voice-check")
+def voice_check(ep_id: str, db: Session = Depends(get_db)):
+    """Resolve each locked voice in an episode's voice_map to its ElevenLabs
+    voice name/labels — catches wrong-ID mixups (e.g. Jordan sounding female)."""
+    ep = db.query(SketchEpisode).filter(SketchEpisode.episode_id == ep_id).first()
+    if not ep:
+        raise HTTPException(404, "Episode not found")
+    out = {}
+    for speaker, vid in (ep.voice_map or {}).items():
+        entry = {"voice_id": vid}
+        if settings.elevenlabs_api_key:
+            try:
+                r = requests.get(f"https://api.elevenlabs.io/v1/voices/{vid}",
+                                 headers={"xi-api-key": settings.elevenlabs_api_key}, timeout=20)
+                if r.status_code == 200:
+                    v = r.json()
+                    entry.update({"name": v.get("name"), "category": v.get("category"),
+                                  "labels": v.get("labels")})
+                else:
+                    entry["error"] = f"HTTP {r.status_code}"
+            except Exception as e:
+                entry["error"] = _redact(e)
+        out[speaker] = entry
+    return {"episode": ep_id, "voices": out}
 
 
 # ============ PIPELINE ============
