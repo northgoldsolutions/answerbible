@@ -275,18 +275,23 @@ def tts_test(voice_id: str = "", text: str = "Jordan here. Testing, one two."):
 @router.get("/still-test")
 def still_test(orientation: str = "portrait",
                prompt: str = "tight close-up portrait of a man in a navy blazer, photorealistic, dramatic lighting"):
-    """Diagnostics: try one OpenAI still in the given orientation and return the
-    exact error if it fails (the pipeline otherwise only logs it server-side)."""
+    """Diagnostics: try one still in the given orientation (OpenAI, then Pika
+    catalog fallback) and return which provider worked or the exact errors."""
     orient = "vertical" if orientation.strip().lower() in ("portrait", "vertical", "9:16") else "landscape"
     path = f"{settings.output_dir}/sketch/_still_test.png"
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    ok = _openai_still(prompt, path, orient)
-    out = {"ok": ok, "orientation": orient,
-           "size": "1024x1536" if orient == "vertical" else "1536x1024"}
-    if ok:
+    ok_o = _openai_still(prompt, path, orient)
+    err_o = _STILL_LAST_ERROR
+    ok_p = False
+    if not ok_o:
+        ok_p = _pika_still(prompt, path, orient)
+    err_p = None if ok_p else _STILL_LAST_ERROR
+    out = {"ok": ok_o or ok_p, "orientation": orient,
+           "provider": "openai" if ok_o else ("pika" if ok_p else None),
+           "openai_error": None if ok_o else err_o,
+           "pika_error": err_p if not ok_o else None}
+    if out["ok"]:
         out["bytes"] = os.path.getsize(path)
-    else:
-        out["error"] = _STILL_LAST_ERROR or "unknown (check logs)"
     return out
 
 
@@ -420,6 +425,36 @@ def _openai_still(prompt: str, output_path: str, orientation: str = "landscape")
         _STILL_LAST_ERROR = f"exception: {_redact(e)}"
         print(f"[Sketch:Still] {_STILL_LAST_ERROR}")
         return False
+
+
+def _pika_still(prompt: str, output_path: str, orientation: str = "landscape",
+                job_log: Optional[list] = None, label: str = "") -> bool:
+    """Fallback still from the Pika image catalog (default: Nano Banana 2) —
+    runs on the Pika balance when OpenAI is out of credits."""
+    global _STILL_LAST_ERROR
+    model_path = os.getenv("PIKA_STILL_PATH") or "/v1/media/google/gemini-3.1-flash-image/text-to-image"
+    res = _pika_job(model_path, {
+        "prompt": (f"cinematic {'9:16 vertical' if orientation == 'vertical' else '16:9'} film still: {prompt}")[:3900],
+        "num_images": 1,
+        "aspect_ratio": "9:16" if orientation == "vertical" else "16:9",
+        "output_format": "png",
+    }, output_path, max_wait=300, job_log=job_log, label=label)
+    if not res["ok"]:
+        _STILL_LAST_ERROR = res["reason"]
+    return res["ok"]
+
+
+def _still(prompt: str, output_path: str, orientation: str = "landscape",
+           job_log: Optional[list] = None, label: str = "") -> bool:
+    """Still chain: OpenAI gpt-image first, Pika image catalog as fallback —
+    an empty OpenAI balance no longer kills the render."""
+    if _openai_still(prompt, output_path, orientation):
+        return True
+    openai_err = _STILL_LAST_ERROR
+    if _pika_still(prompt, output_path, orientation, job_log, label):
+        return True
+    _STILL_LAST_ERROR = f"openai: {openai_err or 'n/a'} | pika: {_STILL_LAST_ERROR or 'n/a'}"
+    return False
 
 
 def _upload_file_to_r2(key: str, file_path: str, content_type: str) -> str:
@@ -709,7 +744,7 @@ def _generate_episode(ep_pk: str):
                             + (f", {desc}" if desc and desc != speaker else "")
                             + ", facing camera, photorealistic, dramatic cinematic lighting"
                             + (f", scene context: {scene.get('still_prompt')}" if scene.get("still_prompt") else ""))
-                        _openai_still(close_prompt, close, orient)
+                        _still(close_prompt, close, orient, jobs, f"s{n} close:{speaker}")
                     if not os.path.exists(close):
                         fail_reason = f"close-up still failed for {speaker}: {_STILL_LAST_ERROR or 'unknown'}"
                         break
@@ -768,7 +803,7 @@ def _generate_episode(ep_pk: str):
 
             _progress(db, ep, f"scene {n}: still")
             still = f"{still_dir}/s{n}.png"
-            _openai_still(scene.get("still_prompt") or ep.title or "Faith vs Views", still, orient)
+            _still(scene.get("still_prompt") or ep.title or "Faith vs Views", still, orient, jobs, f"s{n} still")
 
             motion = f"{still_dir}/s{n}.mp4"
             has_motion = False
