@@ -765,7 +765,7 @@ def _generate_episode(ep_pk: str):
                     res = _pika_job(
                         "/v1/media/kling/kling-ai-avatar-v2/avatar",
                         {"image_url": close_url, "sound_file": audio_url,
-                         "prompt": perf[:900], "mode": os.getenv("PIKA_AVATAR_MODE", "standard")},
+                         "prompt": perf[:900], "mode": os.getenv("PIKA_AVATAR_MODE", "std")},
                         raw_line, max_wait=600, job_log=jobs, label=f"s{n}l{li}:{speaker}")
                     avatar_jobs += 1
                     if not res["ok"]:
