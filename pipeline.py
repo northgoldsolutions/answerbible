@@ -904,6 +904,51 @@ def _get_audio_duration(path: str) -> float:
         pass
     return 5.0
 
+def _notify_published(prod_id: str):
+    """Telegram one-tap bridge: deliver the published video + ready caption to David.
+    Telegram fetches the MP4 from the R2 public URL itself (limit ~20MB); bigger
+    files fall back to a plain link. Always non-fatal — publishing never fails
+    because a notification did."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("[Notify] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set, skipping")
+        return
+    try:
+        engine = get_engine(settings.database_url)
+        db = SessionLocal(bind=engine)
+        prod = db.query(Production).filter(Production.id == prod_id).first()
+        video_url = prod.video_url if prod else None
+        title = (prod.title or prod.topic) if prod else prod_id
+        desc = (prod.description or "").strip() if prod else ""
+        db.close()
+        if not video_url:
+            print(f"[Notify] No video URL for {prod_id}, skipping")
+            return
+        caption = f"✅ PUBLISHED: {title}\n\n{desc}\n\n🔗 {video_url}"[:1000]
+        base = f"https://api.telegram.org/bot{token}"
+        size = 0
+        try:
+            head = requests.head(video_url, timeout=15)
+            size = int(head.headers.get("Content-Length", 0))
+        except Exception:
+            pass
+        if not size or size < 19 * 1024 * 1024:
+            resp = requests.post(f"{base}/sendVideo", data={
+                "chat_id": chat_id, "video": video_url,
+                "caption": caption, "supports_streaming": "true",
+            }, timeout=120)
+            if resp.status_code == 200:
+                print(f"[Notify] Video delivered to Telegram chat {chat_id}")
+                return
+            print(f"[Notify] sendVideo failed {resp.status_code}: {resp.text[:200]} — falling back to link")
+        resp = requests.post(f"{base}/sendMessage", data={
+            "chat_id": chat_id, "text": caption,
+        }, timeout=30)
+        print(f"[Notify] sendMessage rc={resp.status_code}")
+    except Exception as e:
+        print(f"[Notify] Telegram notify exception: {e}")
+
 # ============ END ENGINE ============
 
 @router.post("/productions/{prod_id}/quality")
@@ -957,7 +1002,7 @@ def submit_packaging(prod_id: str, data: PackagingSubmit, db: Session = Depends(
     return {"id": prod.id, "stage": prod.stage.value, "message": "Packaging set. Final approval needed."}
 
 @router.post("/productions/{prod_id}/approve")
-def final_approval(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)):
+def final_approval(prod_id: str, data: ReviewSubmit, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
     if not prod:
         raise HTTPException(404, "Production not found")
@@ -969,6 +1014,7 @@ def final_approval(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_d
         raise HTTPException(400, "BLOCKED: simulated (placeholder) productions cannot be published.")
     prod.stage = Stage.PUBLISHED
     db.commit()
+    background_tasks.add_task(_notify_published, prod_id)
     return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED. Ready for YouTube upload."}
 
 @router.get("/productions/{prod_id}")
