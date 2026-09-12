@@ -669,6 +669,11 @@ def _generate_episode(ep_pk: str):
         lip_sync_on = (str(spec.get("lip_sync", "on")).strip().lower() not in ("off", "false", "0")
                        and (os.getenv("SKETCH_LIPSYNC") or "on").strip().lower() not in ("off", "false", "0"))
         max_avatar = int(os.getenv("SKETCH_MAX_AVATAR_JOBS") or "40")
+        # Talking-shot engine: "lipsync" (default, cheap) animates the close-up
+        # with Pika 2.5 then Kling Lipsync locks the mouth to the line audio;
+        # "avatar" uses full Kling AI Avatar v2 (needs balance > ~$13.50 because
+        # Pika pre-authorizes the 300s worst case at submit).
+        talk_mode = (os.getenv("SKETCH_TALK_MODE") or "lipsync").strip().lower()
         jobs: list = []
         render_report["balance_start_usd"] = _pika_balance_usd()
 
@@ -776,15 +781,63 @@ def _generate_episode(ep_pk: str):
                     perf = (scene.get("performance_prompt")
                             or "natural conversational performance, expressive face, subtle hand gestures")
                     raw_line = f"{still_dir}/s{n}_l{li}_avatar.mp4"
-                    _progress(db, ep, f"scene {n} line {li}: avatar ({speaker})")
-                    res = _pika_job(
-                        "/v1/media/kling/kling-ai-avatar-v2/avatar",
-                        {"image_url": close_url, "sound_file": audio_url,
-                         "prompt": perf[:900], "mode": os.getenv("PIKA_AVATAR_MODE", "std")},
-                        raw_line, max_wait=600, job_log=jobs, label=f"s{n}l{li}:{speaker}")
+                    if talk_mode == "avatar":
+                        _progress(db, ep, f"scene {n} line {li}: avatar ({speaker})")
+                        res = _pika_job(
+                            "/v1/media/kling/kling-ai-avatar-v2/avatar",
+                            {"image_url": close_url, "sound_file": audio_url,
+                             "prompt": perf[:900], "mode": os.getenv("PIKA_AVATAR_MODE", "std")},
+                            raw_line, max_wait=600, job_log=jobs, label=f"s{n}l{li}:{speaker}")
+                    else:
+                        ldur0 = _get_audio_duration(line_audio_p)
+                        if ldur0 <= 0:
+                            ldur0 = 3.0
+                        base_raw = f"{still_dir}/s{n}_l{li}_base.mp4"
+                        _progress(db, ep, f"scene {n} line {li}: base motion ({speaker})")
+                        res_b = _pika_job(
+                            os.getenv("PIKA_GENERATE_PATH") or "/v1/media/pika/pika-2.5/image-to-video",
+                            {"prompt": (perf + ", speaking to camera, slow continuous motion, "
+                                        "single action, no scene changes")[:880],
+                             "resolution": os.getenv("PIKA_RESOLUTION", "720p"),
+                             "duration_s": 5, "image": close_url},
+                            base_raw, max_wait=600, job_log=jobs, label=f"s{n}l{li} base:{speaker}")
+                        if not res_b["ok"]:
+                            # free base: static close-up video; lipsync still animates the mouth
+                            subprocess.run([settings.ffmpeg_path, "-y", "-loop", "1", "-i", close,
+                                            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                                            "-t", str(ldur0), "-c:v", "libx264", "-preset", "veryfast",
+                                            "-pix_fmt", "yuv420p", "-shortest", base_raw],
+                                           capture_output=True, timeout=120)
+                        if not os.path.exists(base_raw):
+                            fail_reason = f"base clip failed: {res_b['reason'][:200]}"
+                            break
+                        if ldur0 > 5.2 and res_b["ok"]:
+                            looped = f"{still_dir}/s{n}_l{li}_base_loop.mp4"
+                            subprocess.run([settings.ffmpeg_path, "-y", "-stream_loop", "-1",
+                                            "-i", base_raw, "-t", str(ldur0), "-an",
+                                            "-c:v", "libx264", "-preset", "veryfast",
+                                            "-pix_fmt", "yuv420p", looped],
+                                           capture_output=True, timeout=180)
+                            if os.path.exists(looped):
+                                base_raw = looped
+                        try:
+                            base_url = _upload_file_to_r2(
+                                f"sketch/clips/{ep.episode_id}-s{n}l{li}_base.mp4", base_raw, "video/mp4")
+                        except Exception as e:
+                            fail_reason = f"R2 upload failed: {_redact(e)[:100]}"
+                            break
+                        _progress(db, ep, f"scene {n} line {li}: lipsync ({speaker})")
+                        res = _pika_job(
+                            "/v1/media/kling/kling-lipsync/avatar",
+                            {"video_url": base_url, "audio_url": audio_url,
+                             "sound_insert_time": 0, "sound_start_time": 0,
+                             "sound_end_time": int(ldur0 * 1000),
+                             "sound_volume": 1, "original_audio_volume": 0},
+                            raw_line, max_wait=600, job_log=jobs, label=f"s{n}l{li}:{speaker}")
                     avatar_jobs += 1
                     if not res["ok"]:
-                        fail_reason = f"avatar s{n}l{li}: {res['reason'][:300]}"
+                        kind = "avatar" if talk_mode == "avatar" else "lipsync"
+                        fail_reason = f"{kind} s{n}l{li}: {res['reason'][:300]}"
                         break
                     ldur = _get_audio_duration(line_audio_p)
                     if ldur <= 0:
@@ -807,7 +860,7 @@ def _generate_episode(ep_pk: str):
                          "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-ar", "44100", clip],
                         capture_output=True, timeout=300)
                     if result.returncode == 0 and os.path.exists(clip):
-                        render_report["scenes"][str(n)] = f"talking_avatar x{len(line_clips)}"
+                        render_report["scenes"][str(n)] = f"talking_{talk_mode} x{len(line_clips)}"
                         render_report["talking"] += 1
                         ep.render_info = dict(render_report)
                         db.commit()
