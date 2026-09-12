@@ -1017,6 +1017,13 @@ def final_approval(prod_id: str, data: ReviewSubmit, background_tasks: Backgroun
     background_tasks.add_task(_notify_published, prod_id)
     return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED. Ready for YouTube upload."}
 
+@router.post("/productions/{prod_id}/notify-test")
+def notify_test(prod_id: str):
+    """Manually re-fire the Telegram publish notification (bridge diagnostics).
+    Runs synchronously so the [Notify] log lines appear immediately in Railway logs."""
+    _notify_published(prod_id)
+    return {"id": prod_id, "message": "Notification fired. Check Telegram; if nothing arrived, look for [Notify] lines in Railway logs."}
+
 @router.get("/productions/{prod_id}")
 def get_production(prod_id: str, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
