@@ -908,12 +908,13 @@ def _notify_published(prod_id: str):
     """Telegram one-tap bridge: deliver the published video + ready caption to David.
     Telegram fetches the MP4 from the R2 public URL itself (limit ~20MB); bigger
     files fall back to a plain link. Always non-fatal — publishing never fails
-    because a notification did."""
+    because a notification did. Returns a small status dict so /notify-test can
+    surface exactly what Telegram said."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         print("[Notify] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set, skipping")
-        return
+        return {"sent": False, "reason": "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set on the server"}
     try:
         engine = get_engine(settings.database_url)
         db = SessionLocal(bind=engine)
@@ -924,7 +925,7 @@ def _notify_published(prod_id: str):
         db.close()
         if not video_url:
             print(f"[Notify] No video URL for {prod_id}, skipping")
-            return
+            return {"sent": False, "reason": "production has no video_url"}
         caption = f"✅ PUBLISHED: {title}\n\n{desc}\n\n🔗 {video_url}"[:1000]
         base = f"https://api.telegram.org/bot{token}"
         size = 0
@@ -933,6 +934,7 @@ def _notify_published(prod_id: str):
             size = int(head.headers.get("Content-Length", 0))
         except Exception:
             pass
+        video_err = ""
         if not size or size < 19 * 1024 * 1024:
             resp = requests.post(f"{base}/sendVideo", data={
                 "chat_id": chat_id, "video": video_url,
@@ -940,14 +942,21 @@ def _notify_published(prod_id: str):
             }, timeout=120)
             if resp.status_code == 200:
                 print(f"[Notify] Video delivered to Telegram chat {chat_id}")
-                return
-            print(f"[Notify] sendVideo failed {resp.status_code}: {resp.text[:200]} — falling back to link")
+                return {"sent": True, "method": "sendVideo", "chat_id": chat_id}
+            video_err = f"sendVideo {resp.status_code}: {resp.text[:200]}"
+            print(f"[Notify] {video_err} — falling back to link")
+        else:
+            video_err = f"file too big for sendVideo ({size} bytes)"
         resp = requests.post(f"{base}/sendMessage", data={
             "chat_id": chat_id, "text": caption,
         }, timeout=30)
-        print(f"[Notify] sendMessage rc={resp.status_code}")
+        print(f"[Notify] sendMessage rc={resp.status_code}: {resp.text[:150]}")
+        if resp.status_code == 200:
+            return {"sent": True, "method": "sendMessage", "chat_id": chat_id, "note": video_err}
+        return {"sent": False, "reason": f"{video_err} | sendMessage {resp.status_code}: {resp.text[:200]}"}
     except Exception as e:
         print(f"[Notify] Telegram notify exception: {e}")
+        return {"sent": False, "reason": f"exception: {type(e).__name__}: {e}"}
 
 # ============ END ENGINE ============
 
@@ -1020,9 +1029,9 @@ def final_approval(prod_id: str, data: ReviewSubmit, background_tasks: Backgroun
 @router.post("/productions/{prod_id}/notify-test")
 def notify_test(prod_id: str):
     """Manually re-fire the Telegram publish notification (bridge diagnostics).
-    Runs synchronously so the [Notify] log lines appear immediately in Railway logs."""
-    _notify_published(prod_id)
-    return {"id": prod_id, "message": "Notification fired. Check Telegram; if nothing arrived, look for [Notify] lines in Railway logs."}
+    Returns exactly what Telegram's API said so setup issues are visible without log access."""
+    result = _notify_published(prod_id)
+    return {"id": prod_id, "telegram": result}
 
 @router.get("/productions/{prod_id}")
 def get_production(prod_id: str, db: Session = Depends(get_db)):
