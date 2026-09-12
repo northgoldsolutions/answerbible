@@ -48,6 +48,8 @@ from pipeline import (
 
 router = APIRouter()
 
+_STILL_LAST_ERROR = ""  # set by _openai_still on failure; surfaced in render report
+
 
 def get_db():
     engine = get_engine(settings.database_url)
@@ -270,6 +272,24 @@ def tts_test(voice_id: str = "", text: str = "Jordan here. Testing, one two."):
         return {"ok": False, "voice_id": vid, "reason": _redact(e)}
 
 
+@router.get("/still-test")
+def still_test(orientation: str = "portrait",
+               prompt: str = "tight close-up portrait of a man in a navy blazer, photorealistic, dramatic lighting"):
+    """Diagnostics: try one OpenAI still in the given orientation and return the
+    exact error if it fails (the pipeline otherwise only logs it server-side)."""
+    orient = "vertical" if orientation.strip().lower() in ("portrait", "vertical", "9:16") else "landscape"
+    path = f"{settings.output_dir}/sketch/_still_test.png"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ok = _openai_still(prompt, path, orient)
+    out = {"ok": ok, "orientation": orient,
+           "size": "1024x1536" if orient == "vertical" else "1536x1024"}
+    if ok:
+        out["bytes"] = os.path.getsize(path)
+    else:
+        out["error"] = _STILL_LAST_ERROR or "unknown (check logs)"
+    return out
+
+
 # ============ PIPELINE ============
 
 def _progress(db: Session, ep: SketchEpisode, msg: str):
@@ -356,9 +376,13 @@ def _concat_audio(line_paths, output_path: str, pause: float = 0.35) -> bool:
 
 
 def _openai_still(prompt: str, output_path: str, orientation: str = "landscape") -> bool:
-    """DALL-E / gpt-image scene still (16:9 landscape or 9:16 vertical)."""
+    """DALL-E / gpt-image scene still (16:9 landscape or 9:16 vertical).
+    Failure reason is captured in _STILL_LAST_ERROR for the render report."""
+    global _STILL_LAST_ERROR
+    _STILL_LAST_ERROR = ""
     key = settings.openai_api_key
     if not key:
+        _STILL_LAST_ERROR = "OPENAI_API_KEY not set"
         return False
     try:
         r = requests.post(
@@ -373,7 +397,8 @@ def _openai_still(prompt: str, output_path: str, orientation: str = "landscape")
             timeout=180,
         )
         if r.status_code != 200:
-            print(f"[Sketch:Still] OpenAI ERROR {r.status_code}: {_redact(r.text[:200])}")
+            _STILL_LAST_ERROR = f"OpenAI HTTP {r.status_code}: {_redact(r.text[:200])}"
+            print(f"[Sketch:Still] {_STILL_LAST_ERROR}")
             return False
         data = r.json()["data"][0]
         import base64
@@ -387,9 +412,13 @@ def _openai_still(prompt: str, output_path: str, orientation: str = "landscape")
                 with open(output_path, "wb") as f:
                     f.write(img.content)
                 return True
+            _STILL_LAST_ERROR = f"image download HTTP {img.status_code}"
+            return False
+        _STILL_LAST_ERROR = "empty image response"
         return False
     except Exception as e:
-        print(f"[Sketch:Still] OpenAI exception: {_redact(e)}")
+        _STILL_LAST_ERROR = f"exception: {_redact(e)}"
+        print(f"[Sketch:Still] {_STILL_LAST_ERROR}")
         return False
 
 
@@ -682,7 +711,7 @@ def _generate_episode(ep_pk: str):
                             + (f", scene context: {scene.get('still_prompt')}" if scene.get("still_prompt") else ""))
                         _openai_still(close_prompt, close, orient)
                     if not os.path.exists(close):
-                        fail_reason = f"close-up still failed for {speaker}"
+                        fail_reason = f"close-up still failed for {speaker}: {_STILL_LAST_ERROR or 'unknown'}"
                         break
                     try:
                         close_url = _upload_file_to_r2(
