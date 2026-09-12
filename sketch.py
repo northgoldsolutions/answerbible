@@ -199,6 +199,21 @@ def pika_check():
     return out
 
 
+@router.get("/pika-job/{job_id}")
+def pika_job_status(job_id: str):
+    """Fetch a Pika job's full status JSON (usage, charge, error code) —
+    built for reading failed-job envelopes from a phone."""
+    key = (settings.pika_api_key or "").strip()
+    if not key:
+        return {"ok": False, "reason": "PIKA_API_KEY not set on server"}
+    try:
+        r = requests.get(f"{_pika_base()}/v1/media/jobs/{job_id}",
+                         headers={"X-API-Key": key}, timeout=30)
+        return {"http_status": r.status_code, "job": r.json() if r.headers.get("content-type", "").startswith("application/json") else _redact(r.text[:500])}
+    except Exception as e:
+        return {"ok": False, "reason": _redact(e)}
+
+
 @router.get("/voices")
 def list_voices():
     """List every ElevenLabs voice on this account (name + id + labels) so
@@ -769,7 +784,7 @@ def _generate_episode(ep_pk: str):
                         raw_line, max_wait=600, job_log=jobs, label=f"s{n}l{li}:{speaker}")
                     avatar_jobs += 1
                     if not res["ok"]:
-                        fail_reason = f"avatar s{n}l{li}: {res['reason'][:120]}"
+                        fail_reason = f"avatar s{n}l{li}: {res['reason'][:300]}"
                         break
                     ldur = _get_audio_duration(line_audio_p)
                     if ldur <= 0:
