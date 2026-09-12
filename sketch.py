@@ -826,12 +826,14 @@ def _generate_episode(ep_pk: str):
                         except Exception as e:
                             fail_reason = f"R2 upload failed: {_redact(e)[:100]}"
                             break
+                        base_dur = _get_audio_duration(base_raw)  # ffprobe duration works on video too
+                        sync_ms = max(500, int(min(ldur0, base_dur) * 1000) - 120)
                         _progress(db, ep, f"scene {n} line {li}: lipsync ({speaker})")
                         res = _pika_job(
                             "/v1/media/kling/kling-lipsync/avatar",
                             {"video_url": base_url, "audio_url": audio_url,
                              "sound_insert_time": 0, "sound_start_time": 0,
-                             "sound_end_time": int(ldur0 * 1000),
+                             "sound_end_time": sync_ms,
                              "sound_volume": 1, "original_audio_volume": 0},
                             raw_line, max_wait=600, job_log=jobs, label=f"s{n}l{li}:{speaker}")
                     avatar_jobs += 1
