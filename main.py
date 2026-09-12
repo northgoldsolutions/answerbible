@@ -10,7 +10,7 @@ from sketch import router as sketch_router
 from video_providers import provider_status
 from config import settings
 
-app = FastAPI(title="Answers in Faith Engine", version="1.2.0")
+app = FastAPI(title="Answers in Faith Engine", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +30,7 @@ app.include_router(sketch_router, prefix="/sketch")
 def health():
     return {
         "status": "ok",
-        "engine": "Answers in Faith v1.2",
+        "engine": "Answers in Faith v1.2.1",
         "theological_gates": 12,
         "video_providers": provider_status(),
         "sketch": {
@@ -40,7 +40,11 @@ def health():
             "elevenlabs_dialogue": bool(settings.elevenlabs_api_key),
         },
         "r2_configured": bool(os.getenv("R2_ACCOUNT_ID") and os.getenv("R2_BUCKET_NAME")),
-        "r2_public_url_set": bool(os.getenv("R2_PUBLIC_URL")),
+        # Non-secret diagnostics so bucket/public-URL mismatches are visible
+        # without dashboard access. Keys are never exposed.
+        "r2_account_id": os.getenv("R2_ACCOUNT_ID", ""),
+        "r2_bucket": os.getenv("R2_BUCKET_NAME", ""),
+        "r2_public_url": os.getenv("R2_PUBLIC_URL", ""),
     }
 
 @app.get("/api/download/{prod_id}")
