@@ -16,6 +16,7 @@
 #   GET  /sketch/episodes/{id}             -> status/progress/render report
 #   GET  /sketch/episodes/{id}/download    -> get video URL (R2 or local file)
 #   DELETE /sketch/episodes/{id}           -> remove episode
+#   GET  /sketch/pika-check                -> Pika key/base-URL diagnostic
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -157,6 +158,27 @@ def delete_episode(ep_id: str, db: Session = Depends(get_db)):
     db.delete(ep)
     db.commit()
     return {"id": ep_id, "message": "Deleted"}
+
+
+@router.get("/pika-check")
+def pika_check():
+    """Diagnostics: is the Pika key valid and is the base URL correct?
+    Hits Pika's billing endpoint (free) and reports exactly what came back."""
+    key = (settings.pika_api_key or "").strip()
+    if not key:
+        return {"ok": False, "reason": "PIKA_API_KEY not set on server"}
+    base = (settings.pika_api_url or "https://api.dev.pika.art").rstrip("/")
+    headers = {"X-API-Key": key}
+    out = {"base_url": base, "key_prefix": key[:7] + "...", "checks": {}}
+    for path in ("/v1/billing/balance", "/billing/balance"):
+        try:
+            r = requests.get(f"{base}{path}", headers=headers, timeout=20)
+            out["checks"][path] = {"status": r.status_code, "body": _redact(r.text[:200])}
+        except Exception as e:
+            out["checks"][path] = {"error": _redact(e)}
+    ok = any(c.get("status") == 200 for c in out["checks"].values())
+    out["ok"] = ok
+    return out
 
 
 # ============ PIPELINE ============
@@ -315,7 +337,7 @@ def _pika_video(prompt: str, out_path: str, duration: float,
             payload["image"] = image_url
         r = requests.post(f"{base}{model_path}", headers=headers, json=payload, timeout=60)
         if r.status_code not in (200, 201, 202):
-            return {"ok": False, "reason": f"submit HTTP {r.status_code}: {_redact(r.text[:200])}"}
+            return {"ok": False, "reason": f"submit HTTP {r.status_code} at {base}{model_path}: {_redact(r.text[:150])}"}
         job = r.json()
         job_id = job.get("id")
         if not job_id:
