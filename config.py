@@ -13,8 +13,9 @@ class Settings(BaseSettings):
     output_dir: str = "./output"
     max_scene_duration: int = 15
     # Faith vs Views sketch pipeline (/sketch/*)
+    # Official Pika API: get a key at dev.pika.art (X-API-Key header auth)
     pika_api_key: str = ""
-    pika_api_url: str = "https://api.pika.art"
+    pika_api_url: str = "https://api.dev.pika.art"
 
     class Config:
         env_file = ".env"

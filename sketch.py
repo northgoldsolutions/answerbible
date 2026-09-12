@@ -4,18 +4,22 @@
 #   OpenAI stills -> Pika motion (fallback: Ken Burns on the still at assembly)
 #   -> per-character ElevenLabs dialogue -> FFmpeg assembly -> R2 upload.
 #
+# Pika = official API (dev.pika.art): submit job with X-API-Key, poll
+# /v1/media/jobs/{id}, download from /content. Image inputs need a public URL,
+# so scene stills are pushed to R2 first and that URL is handed to Pika.
+#
 # Endpoints (mounted at /sketch):
 #   POST /sketch/episodes                  -> create episode from spec JSON
 #   GET  /sketch/episodes                  -> list episodes
 #   POST /sketch/episodes/{id}/generate    -> start pipeline (background)
-#   GET  /sketch/episodes/{id}             -> status/progress
+#     ?relock_voices=true                  -> forget locked voices, pick fresh
+#   GET  /sketch/episodes/{id}             -> status/progress/render report
 #   GET  /sketch/episodes/{id}/download    -> get video URL (R2 or local file)
 #   DELETE /sketch/episodes/{id}           -> remove episode
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Optional, Dict, Any
-import base64
 import os
 import subprocess
 import time
@@ -44,7 +48,7 @@ def get_db():
 
 def _redact(msg) -> str:
     import re
-    msg = re.sub(r'Bearer\s+[A-Za-z0-9._~-]+', 'Bearer [redacted]', str(msg))
+    msg = re.sub(r'(X-API-Key|Bearer)\s+[A-Za-z0-9._~-]+', r'\1 [redacted]', str(msg))
     msg = re.sub(r'(api[_-]?key|token|secret)=([^\s&]+)', r'\1=[redacted]', msg, flags=re.I)
     return msg[:400]
 
@@ -66,6 +70,7 @@ def create_episode(data: Dict[str, Any], db: Session = Depends(get_db)):
         ep.error = None
         ep.video_url = None
         ep.voice_map = {}
+        ep.render_info = {}
         msg = "Episode spec replaced. Run generate."
     else:
         ep = SketchEpisode(
@@ -77,6 +82,7 @@ def create_episode(data: Dict[str, Any], db: Session = Depends(get_db)):
             progress="spec stored",
             spec=data,
             voice_map={},
+            render_info={},
         )
         db.add(ep)
         msg = "Episode created. Run generate."
@@ -96,7 +102,8 @@ def list_episodes(db: Session = Depends(get_db)):
 
 
 @router.post("/episodes/{ep_id}/generate")
-def generate_episode(ep_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def generate_episode(ep_id: str, background_tasks: BackgroundTasks,
+                     relock_voices: bool = False, db: Session = Depends(get_db)):
     ep = db.query(SketchEpisode).filter(SketchEpisode.episode_id == ep_id).first()
     if not ep:
         raise HTTPException(404, "Episode not found")
@@ -104,12 +111,15 @@ def generate_episode(ep_id: str, background_tasks: BackgroundTasks, db: Session 
         raise HTTPException(400, "Already generating. Poll GET /sketch/episodes/{id} for progress.")
     if not (ep.spec or {}).get("scenes"):
         raise HTTPException(400, "Episode spec has no scenes.")
+    if relock_voices:
+        ep.voice_map = {}
     ep.status = "generating"
     ep.progress = "queued"
     ep.error = None
+    ep.render_info = {}
     db.commit()
     background_tasks.add_task(_generate_episode, ep.id)
-    return {"id": ep.episode_id, "status": "generating",
+    return {"id": ep.episode_id, "status": "generating", "relock_voices": relock_voices,
             "message": "Sketch pipeline started in background. Poll GET /sketch/episodes/{id}."}
 
 
@@ -121,6 +131,7 @@ def get_episode(ep_id: str, db: Session = Depends(get_db)):
     return {"id": ep.episode_id, "title": ep.title, "claim": ep.claim,
             "status": ep.status, "progress": ep.progress, "error": ep.error,
             "video_url": ep.video_url, "voice_map": ep.voice_map or {},
+            "render_info": ep.render_info or {},
             "scene_count": len((ep.spec or {}).get("scenes", [])),
             "updated_at": ep.updated_at.isoformat() if ep.updated_at else None}
 
@@ -254,6 +265,7 @@ def _openai_still(prompt: str, output_path: str) -> bool:
             print(f"[Sketch:Still] OpenAI ERROR {r.status_code}: {_redact(r.text[:200])}")
             return False
         data = r.json()["data"][0]
+        import base64
         if data.get("b64_json"):
             with open(output_path, "wb") as f:
                 f.write(base64.b64decode(data["b64_json"]))
@@ -270,72 +282,88 @@ def _openai_still(prompt: str, output_path: str) -> bool:
         return False
 
 
-def _pika_video(prompt: str, out_path: str, duration: float, image_path: Optional[str] = None) -> bool:
-    """Pika text/image-to-video. Endpoint is env-configurable because Pika's API
-    surface moves: PIKA_API_URL (base) + PIKA_GENERATE_PATH. If Pika is not
-    configured or errors out, caller falls back to Ken Burns on the still."""
+def _upload_file_to_r2(key: str, file_path: str, content_type: str) -> str:
+    """Upload any file to R2 and return its public URL (used to hand stills to Pika)."""
+    bucket = os.getenv("R2_BUCKET_NAME")
+    if not bucket:
+        raise ValueError("Missing R2_BUCKET_NAME")
+    client = get_r2_client()
+    client.upload_file(file_path, bucket, key, ExtraArgs={"ContentType": content_type})
+    return f"{_r2_public_base()}/{key}"
+
+
+def _pika_video(prompt: str, out_path: str, duration: float,
+                image_url: Optional[str] = None) -> Dict[str, Any]:
+    """Official Pika API (dev.pika.art). Submit job -> poll -> download.
+    Returns {"ok": bool, "reason": str} so the render report shows exactly why
+    a scene fell back to Ken Burns instead of failing silently."""
     key = (settings.pika_api_key or "").strip()
     if not key:
-        return False
-    base = (settings.pika_api_url or "https://api.pika.art").rstrip("/")
-    gen_path = os.getenv("PIKA_GENERATE_PATH", "/v1/generations/video")
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        return {"ok": False, "reason": "PIKA_API_KEY not set"}
+    base = (settings.pika_api_url or "https://api.dev.pika.art").rstrip("/")
+    model_path = os.getenv("PIKA_GENERATE_PATH") or (
+        "/v1/media/pika/pika-2.5/image-to-video" if image_url
+        else "/v1/media/pika/pika-2.5/text-to-video")
+    headers = {"X-API-Key": key, "Content-Type": "application/json"}
     try:
         payload = {
             "prompt": prompt[:900],
-            "duration": int(max(3, min(10, round(duration)))),
-            "aspect_ratio": "16:9",
+            "resolution": os.getenv("PIKA_RESOLUTION", "720p"),
+            "duration_s": 5,  # Pika 2.5 clips are fixed at 5s; we loop to fit audio
         }
-        if image_path and os.path.exists(image_path):
-            with open(image_path, "rb") as f:
-                payload["image"] = "data:image/png;base64," + base64.b64encode(f.read()).decode()
-        r = requests.post(f"{base}{gen_path}", headers=headers, json=payload, timeout=90)
+        if image_url:
+            payload["image"] = image_url
+        r = requests.post(f"{base}{model_path}", headers=headers, json=payload, timeout=60)
         if r.status_code not in (200, 201, 202):
-            print(f"[Sketch:Pika] generate ERROR {r.status_code}: {_redact(r.text[:200])}")
-            return False
-        data = r.json()
-        url = data.get("video_url") or (data.get("video") or {}).get("url") or data.get("url")
-        job = data.get("id") or data.get("job_id") or data.get("generation_id")
+            return {"ok": False, "reason": f"submit HTTP {r.status_code}: {_redact(r.text[:200])}"}
+        job = r.json()
+        job_id = job.get("id")
+        if not job_id:
+            return {"ok": False, "reason": f"no job id in response: {str(job)[:200]}"}
+
         deadline = time.time() + 600
-        while not url and job and time.time() < deadline:
+        status = {}
+        while time.time() < deadline:
             time.sleep(5)
-            s = requests.get(f"{base}{gen_path}/{job}", headers=headers, timeout=30)
+            s = requests.get(f"{base}/v1/media/jobs/{job_id}", headers=headers, timeout=30)
             if s.status_code != 200:
-                print(f"[Sketch:Pika] poll ERROR {s.status_code}: {_redact(s.text[:200])}")
-                return False
-            d = s.json()
-            if str(d.get("status", "")).lower() in ("failed", "error", "canceled"):
-                print(f"[Sketch:Pika] job failed: {_redact(d)}")
-                return False
-            url = d.get("video_url") or (d.get("video") or {}).get("url") or d.get("url")
+                return {"ok": False, "reason": f"poll HTTP {s.status_code}: {_redact(s.text[:200])}"}
+            status = s.json()
+            st = str(status.get("status", "")).lower()
+            if st == "completed":
+                break
+            if st in ("failed", "error", "canceled"):
+                return {"ok": False, "reason": f"job {st}: {_redact(status.get('error') or status)}"}
+        else:
+            return {"ok": False, "reason": "timed out after 10 min"}
+
+        url = None
+        out = status.get("output")
+        if isinstance(out, str):
+            url = out
+        elif isinstance(out, dict):
+            url = out.get("url")
         if not url:
-            print("[Sketch:Pika] no video URL returned")
-            return False
+            c = requests.get(f"{base}/v1/media/jobs/{job_id}/content", headers=headers, timeout=30)
+            if c.status_code == 200:
+                url = c.json().get("url")
+        if not url:
+            return {"ok": False, "reason": "completed but no output URL"}
+
         dl = requests.get(str(url), timeout=240)
         if dl.status_code == 200 and len(dl.content) > 10000:
             with open(out_path, "wb") as f:
                 f.write(dl.content)
-            return True
-        print(f"[Sketch:Pika] download failed: HTTP {dl.status_code}")
-        return False
+            return {"ok": True, "reason": "ok"}
+        return {"ok": False, "reason": f"download HTTP {dl.status_code}"}
     except Exception as e:
-        print(f"[Sketch:Pika] exception: {_redact(e)}")
-        return False
-
-
-def _upload_sketch_video(ep_id: str, file_path: str) -> str:
-    bucket = os.getenv("R2_BUCKET_NAME")
-    if not bucket:
-        raise ValueError("Missing R2_BUCKET_NAME")
-    key = f"sketch/{ep_id}.mp4"
-    client = get_r2_client()
-    client.upload_file(file_path, bucket, key, ExtraArgs={"ContentType": "video/mp4"})
-    return f"{_r2_public_base()}/{key}"
+        return {"ok": False, "reason": f"exception: {_redact(e)}"}
 
 
 def _generate_episode(ep_pk: str):
     engine = get_engine(settings.database_url)
     db = SessionLocal(bind=engine)
+    render_report = {"scenes": {}, "pika_ok": 0, "ken_burns": 0, "placeholder": 0}
     try:
         ep = db.query(SketchEpisode).filter(SketchEpisode.id == ep_pk).first()
         if not ep:
@@ -382,7 +410,7 @@ def _generate_episode(ep_pk: str):
         ep.voice_map = voice_map  # LOCK_ON_FIRST_GENERATION: persist chosen voices
         db.commit()
 
-        # --- Step 2: visuals per scene (OpenAI still -> Pika motion) ---
+        # --- Step 2: visuals per scene (OpenAI still -> R2 URL -> Pika motion) ---
         clips = []
         for scene in scenes:
             n = scene.get("scene")
@@ -400,9 +428,26 @@ def _generate_episode(ep_pk: str):
             has_motion = False
             if (settings.pika_api_key or "").strip():
                 _progress(db, ep, f"scene {n}: pika motion")
-                has_motion = _pika_video(
+                still_url = None
+                if os.path.exists(still):
+                    try:
+                        still_url = _upload_file_to_r2(
+                            f"sketch/stills/{ep.episode_id}-s{n}.png", still, "image/png")
+                    except Exception as e:
+                        print(f"[Sketch:Pika] still upload failed, text-to-video instead: {_redact(e)}")
+                res = _pika_video(
                     scene.get("motion_prompt") or scene.get("still_prompt") or "subtle cinematic motion",
-                    motion, dur, image_path=still if os.path.exists(still) else None)
+                    motion, dur, image_url=still_url)
+                has_motion = res["ok"]
+                render_report["scenes"][str(n)] = (
+                    "pika" if res["ok"] else f"ken_burns_fallback ({res['reason'][:120]}")
+                if res["ok"]:
+                    render_report["pika_ok"] += 1
+                else:
+                    render_report["ken_burns"] += 1
+                    print(f"[Sketch:Pika] scene {n} fell back: {res['reason'][:200]}")
+                ep.render_info = dict(render_report)
+                db.commit()
 
             clip = f"{clip_dir}/s{n}.mp4"
             _progress(db, ep, f"scene {n}: render clip")
@@ -414,6 +459,8 @@ def _generate_episode(ep_pk: str):
                 _generate_placeholder_visual(scene.get("still_prompt") or "Faith vs Views",
                                              f"{still_dir}/s{n}_ph.png", "landscape")
                 result = _clip_from_image(f"{still_dir}/s{n}_ph.png", audio, dur, clip, "landscape")
+                render_report["scenes"][str(n)] = "placeholder"
+                render_report["placeholder"] += 1
             if result.returncode != 0 or not os.path.exists(clip):
                 raise RuntimeError(f"scene {n}: clip render failed: {result.stderr.decode()[-250:]}")
             clips.append(clip)
@@ -439,13 +486,16 @@ def _generate_episode(ep_pk: str):
         # --- Step 4: R2 upload ---
         _progress(db, ep, "uploading to R2")
         try:
-            ep.video_url = _upload_sketch_video(ep.episode_id, final)
+            ep.video_url = _upload_file_to_r2(f"sketch/{ep.episode_id}.mp4", final, "video/mp4")
             print(f"[Sketch:{ep.episode_id}] R2: {ep.video_url}")
         except Exception as e:
             print(f"[Sketch:{ep.episode_id}] R2 upload failed (local kept): {_redact(e)}")
 
+        ep.render_info = dict(render_report)
         ep.status = "done"
-        _progress(db, ep, "done")
+        _progress(db, ep, f"done (pika: {render_report['pika_ok']}, "
+                         f"ken_burns: {render_report['ken_burns']}, "
+                         f"placeholder: {render_report['placeholder']})")
     except Exception as e:
         print(f"[Sketch] generation error: {_redact(e)}")
         try:
@@ -454,6 +504,7 @@ def _generate_episode(ep_pk: str):
                 ep.status = "failed"
                 ep.error = _redact(e)
                 ep.progress = "failed"
+                ep.render_info = dict(render_report)
                 db.commit()
         except Exception as e2:
             print(f"[Sketch] failed to record error: {e2}")
