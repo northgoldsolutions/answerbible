@@ -172,6 +172,25 @@ class ReviewDecision(Base):
 
     production = relationship("Production", back_populates="reviews")
 
+class SketchEpisode(Base):
+    """Faith vs Views sketch pipeline (/sketch/*) — separate from the Answers in
+    Faith productions table. spec holds the full episode JSON verbatim;
+    voice_map persists the voices locked on first generation."""
+    __tablename__ = "sketch_episodes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    episode_id = Column(String, unique=True, index=True)
+    title = Column(Text)
+    claim = Column(Text)
+    status = Column(String, default="SCRIPT_READY")  # SCRIPT_READY | generating | done | failed
+    progress = Column(String, default="")
+    error = Column(Text)
+    spec = Column(JSON, default=dict)
+    voice_map = Column(JSON, default=dict)
+    video_url = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 def get_engine(db_url=None):
     if db_url is None:
         db_url = os.getenv("DATABASE_URL", "sqlite:///./answers_in_faith.db")
