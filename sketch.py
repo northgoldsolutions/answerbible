@@ -462,9 +462,13 @@ def _generate_episode(ep_pk: str):
                             f"sketch/stills/{ep.episode_id}-s{n}.png", still, "image/png")
                     except Exception as e:
                         print(f"[Sketch:Pika] still upload failed, text-to-video instead: {_redact(e)}")
-                res = _pika_video(
-                    scene.get("motion_prompt") or scene.get("still_prompt") or "subtle cinematic motion",
-                    motion, dur, image_url=still_url)
+                raw_motion = (scene.get("motion_prompt") or scene.get("still_prompt")
+                              or "subtle cinematic motion")
+                # Tighten for 5s fixed-length clips that loop under dialogue:
+                # one continuous action, no cuts, loops cleanly.
+                tight_motion = (raw_motion + ", slow continuous motion only, single action, "
+                                "no scene changes, seamless loop")[:880]
+                res = _pika_video(tight_motion, motion, dur, image_url=still_url)
                 has_motion = res["ok"]
                 render_report["scenes"][str(n)] = (
                     "pika" if res["ok"] else f"ken_burns_fallback ({res['reason'][:120]}")
