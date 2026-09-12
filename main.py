@@ -6,10 +6,11 @@ import os
 
 from models import init_db, get_engine
 from pipeline import router as pipeline_router
+from sketch import router as sketch_router
 from video_providers import provider_status
 from config import settings
 
-app = FastAPI(title="Answers in Faith Engine", version="1.1.0")
+app = FastAPI(title="Answers in Faith Engine", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,14 +24,21 @@ engine = get_engine(settings.database_url)
 init_db(engine)
 
 app.include_router(pipeline_router, prefix="/api")
+app.include_router(sketch_router, prefix="/sketch")
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "engine": "Answers in Faith v1.1",
+        "engine": "Answers in Faith v1.2",
         "theological_gates": 12,
         "video_providers": provider_status(),
+        "sketch": {
+            "router": True,
+            "pika_configured": bool((settings.pika_api_key or "").strip()),
+            "openai_stills": bool(settings.openai_api_key),
+            "elevenlabs_dialogue": bool(settings.elevenlabs_api_key),
+        },
         "r2_configured": bool(os.getenv("R2_ACCOUNT_ID") and os.getenv("R2_BUCKET_NAME")),
         "r2_public_url_set": bool(os.getenv("R2_PUBLIC_URL")),
     }

@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     ffmpeg_path: str = "ffmpeg"
     output_dir: str = "./output"
     max_scene_duration: int = 15
+    # Faith vs Views sketch pipeline (/sketch/*)
+    pika_api_key: str = ""
+    pika_api_url: str = "https://api.pika.art"
 
     class Config:
         env_file = ".env"
@@ -22,3 +25,4 @@ os.makedirs(settings.output_dir, exist_ok=True)
 os.makedirs(f"{settings.output_dir}/audio", exist_ok=True)
 os.makedirs(f"{settings.output_dir}/visuals", exist_ok=True)
 os.makedirs(f"{settings.output_dir}/final", exist_ok=True)
+os.makedirs(f"{settings.output_dir}/sketch", exist_ok=True)
