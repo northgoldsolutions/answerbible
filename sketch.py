@@ -19,7 +19,8 @@
 #   GET  /sketch/pika-check                -> Pika key/base-URL diagnostic
 #   GET  /sketch/voices                    -> list ElevenLabs account voices
 #   GET  /sketch/episodes/{id}/voice-check -> resolve locked voices to names
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+#   GET  /sketch/tts-test?voice_id=..&text=..  -> one-line voice sample or exact TTS error
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Optional, Dict, Any
@@ -231,6 +232,34 @@ def voice_check(ep_id: str, db: Session = Depends(get_db)):
                 entry["error"] = _redact(e)
         out[speaker] = entry
     return {"episode": ep_id, "voices": out}
+
+
+@router.get("/tts-test")
+def tts_test(voice_id: str = "", text: str = "Jordan here. Testing, one two."):
+    """Phone-friendly voice tester: generate one line with a given ElevenLabs
+    voice ID and return the audio directly — or the exact error if this account
+    can't use that voice (not saved to My Voices, plan restriction, bad ID)."""
+    vid = (voice_id or "").strip() or settings.elevenlabs_voice_id
+    if not settings.elevenlabs_api_key:
+        return {"ok": False, "reason": "ELEVENLABS_API_KEY not set"}
+    try:
+        r = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{vid}",
+            headers={"xi-api-key": settings.elevenlabs_api_key,
+                     "Content-Type": "application/json"},
+            json={"text": text[:300], "model_id": "eleven_turbo_v2_5",
+                  "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}},
+            timeout=45,
+        )
+        if r.status_code == 200 and len(r.content) > 1000:
+            return Response(content=r.content, media_type="audio/mpeg")
+        return {"ok": False, "voice_id": vid, "status": r.status_code,
+                "detail": _redact(r.text[:300]),
+                "hint": "Voice not accessible to this account. In ElevenLabs go to "
+                        "Voices -> Explore, find the voice, tap '+' to add it to "
+                        "My Voices, then retry. Some library voices need a paid plan."}
+    except Exception as e:
+        return {"ok": False, "voice_id": vid, "reason": _redact(e)}
 
 
 # ============ PIPELINE ============
@@ -456,6 +485,7 @@ def _generate_episode(ep_pk: str):
 
         # --- Step 1: dialogue TTS per scene (per-character voices, locked) ---
         scene_audio = {}
+        tts_report = {}
         for scene in scenes:
             n = scene.get("scene")
             _progress(db, ep, f"scene {n}: dialogue TTS")
@@ -470,17 +500,23 @@ def _generate_episode(ep_pk: str):
                 ok = False
                 if settings.elevenlabs_api_key:
                     ok = _eleven_tts(text, voice_id, path)
+                    if ok:
+                        tts_report[f"s{n}_l{li}"] = f"elevenlabs:{voice_id} ({speaker})"
                 if not ok and settings.openai_api_key:
                     ok = _openai_tts(text, path)
+                    if ok:
+                        tts_report[f"s{n}_l{li}"] = f"OPENAI_ALLOY_FALLBACK ({speaker}, wanted elevenlabs:{voice_id})"
                 if not ok:
                     est = max(2.0, len(text) * 0.06)
                     _silent_audio(path, est)
+                    tts_report[f"s{n}_l{li}"] = f"SILENT_FALLBACK ({speaker}, wanted elevenlabs:{voice_id})"
                     print(f"[Sketch:TTS] silent fallback for scene {n} line {li}")
                 line_paths.append(path)
             joined = f"{audio_dir}/s{n}.mp3"
             if not _concat_audio(line_paths, joined):
                 raise RuntimeError(f"scene {n}: dialogue audio concat failed")
             scene_audio[n] = joined
+        render_report["tts"] = tts_report  # which engine/voice actually spoke each line
         ep.voice_map = voice_map  # LOCK_ON_FIRST_GENERATION: persist chosen voices
         db.commit()
 
