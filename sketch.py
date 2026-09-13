@@ -61,12 +61,13 @@ _STYLE_SUFFIX = {
     "minimalist": ", minimalist flat illustration, clean geometric shapes, soft muted color palette",
 }
 
-# ElevenLabs premade voices verified to work on the free plan. Named characters
-# without a SKETCH_VOICE_<NAME> env override draw from this pool (stable per name).
+# ElevenLabs premade voices verified to work on the free plan (name, id, gender).
+# Named characters without a SKETCH_VOICE_<NAME> env override draw from the
+# gender-matching sub-pool (stable per name), skipping voices already taken.
 _VOICE_POOL = [
-    ("Bill", "pqHfZKP75CvOlQylNhV4"), ("Sarah", "EXAVITQu4vr4xnSDxMaL"),
-    ("Brian", "nPczCjzI2devNBz1zQrb"), ("Daniel", "onwK4e9ZLuTAKqWW03F9"),
-    ("Liam", "TX3LPaxmHKxFdv7VOQHJ"), ("Matilda", "XrExE9yKIg1WjnnlVkGX"),
+    ("Bill", "pqHfZKP75CvOlQylNhV4", "m"), ("Sarah", "EXAVITQu4vr4xnSDxMaL", "f"),
+    ("Brian", "nPczCjzI2devNBz1zQrb", "m"), ("Daniel", "onwK4e9ZLuTAKqWW03F9", "m"),
+    ("Liam", "TX3LPaxmHKxFdv7VOQHJ", "m"), ("Matilda", "XrExE9yKIg1WjnnlVkGX", "f"),
 ]
 
 
@@ -228,7 +229,7 @@ def list_styles():
 @router.post("/from-liner")
 def episode_from_liner(data: Dict[str, Any], db: Session = Depends(get_db)):
     """One-liner -> full episode spec, written by an LLM on the Pika key (costs
-    fractions of a cent). Stores the episode as SCRIPT_READY with a script
+    a few cents). Stores the episode as SCRIPT_READY with a script
     preview — review it, then run /generate when ready."""
     liner = (data.get("one_liner") or "").strip()
     if not liner:
@@ -245,6 +246,7 @@ def episode_from_liner(data: Dict[str, Any], db: Session = Depends(get_db)):
         f'One-liner idea: "{liner}"\n\n'
         "Write a complete episode spec as STRICT JSON (no markdown fences, no commentary) with EXACTLY this shape:\n"
         '{"title": str, "claim": str, "characters": {"<firstname lowercase>": {"voice_id": "LOCK_ON_FIRST_GENERATION", '
+        '"gender": "male|female", '
         '"description": "<10-20 word visual: age, hair, wardrobe>"}, "narrator": {"voice_id": "LOCK_ON_FIRST_GENERATION", '
         '"description": "off-screen narrator"}}, "scenes": [...]}\n'
         "Scene shapes:\n"
@@ -256,6 +258,7 @@ def episode_from_liner(data: Dict[str, Any], db: Session = Depends(get_db)):
         '"dialogue": [{"speaker": "narrator", "line": "<max 30 words>"}]}\n'
         "Rules:\n"
         "- 2 named hosts with opposing viewpoints; keep each host's wardrobe description identical across the spec.\n"
+        "- Set each host's gender to match their name so voice casting fits the face.\n"
         "- 4 to 6 scenes. Scene 1 is a talking scene opening on the strongest hook line. "
         "Alternate talking scenes and narrator bridges. Final scene ends on a cliffhanger teasing the next episode.\n"
         "- Dialogue sounds like real speech: short sentences, no preaching.\n"
@@ -452,10 +455,29 @@ def _voice_for(speaker: str, chars: Dict[str, Any], voice_map: Dict[str, str]) -
         if speaker.strip().lower() == "narrator":
             vid = settings.elevenlabs_voice_id
         else:
-            # one-liner characters: stable distinct premade voice per name
+            # one-liner characters: stable distinct premade voice per name,
+            # gender-matched, never one another character already claimed
             import hashlib
-            idx = int(hashlib.md5(speaker.strip().lower().encode()).hexdigest(), 16) % len(_VOICE_POOL)
-            vid = _VOICE_POOL[idx][1]
+            gender = ""
+            csheet = chars.get(speaker)
+            if isinstance(csheet, dict):
+                gender = str(csheet.get("gender") or "").strip().lower()
+            pool = [v for v in _VOICE_POOL if v[2] == ("f" if gender.startswith("f") else "m")] or _VOICE_POOL
+            taken = set(voice_map.values())
+            for other, oc in chars.items():
+                if other == speaker:
+                    continue
+                ov = (os.getenv(f"SKETCH_VOICE_{other.upper()}") or "").strip()
+                if ov:
+                    taken.add(ov)
+                if isinstance(oc, dict):
+                    ocv = (oc.get("voice_id") or "").strip()
+                    if ocv and ocv != "LOCK_ON_FIRST_GENERATION":
+                        taken.add(ocv)
+            idx = int(hashlib.md5(speaker.strip().lower().encode()).hexdigest(), 16) % len(pool)
+            while pool[idx][1] in taken and len(taken) < len(pool):
+                idx = (idx + 1) % len(pool)
+            vid = pool[idx][1]
     voice_map[speaker] = vid
     return vid
 
