@@ -20,6 +20,8 @@
 #   GET  /sketch/voices                    -> list ElevenLabs account voices
 #   GET  /sketch/episodes/{id}/voice-check -> resolve locked voices to names
 #   GET  /sketch/tts-test?voice_id=..&text=..  -> one-line voice sample or exact TTS error
+#   GET  /sketch/styles                      -> visual style presets
+#   POST /sketch/from-liner                  -> one-liner idea -> full episode spec (LLM)
 #
 # v2: dialogue scenes render as per-line talking close-ups (Kling AI Avatar v2
 # via the Pika model catalog, same key) so mouths sync to the ElevenLabs audio.
@@ -38,6 +40,7 @@ import time
 import uuid
 from datetime import datetime
 import requests
+import json
 
 from models import SketchEpisode, get_engine, SessionLocal
 from config import settings
@@ -49,6 +52,22 @@ from pipeline import (
 router = APIRouter()
 
 _STILL_LAST_ERROR = ""  # set by _openai_still on failure; surfaced in render report
+
+# Visual style presets — spec key "style" picks one; the suffix is appended to
+# every still/close-up prompt so the whole episode shares one look.
+_STYLE_SUFFIX = {
+    "hyperreal": ", photorealistic, cinematic film still, dramatic lighting, shallow depth of field",
+    "cartoon": ", polished 3D animated cartoon style, expressive stylized characters, vibrant cinematic colors",
+    "minimalist": ", minimalist flat illustration, clean geometric shapes, soft muted color palette",
+}
+
+# ElevenLabs premade voices verified to work on the free plan. Named characters
+# without a SKETCH_VOICE_<NAME> env override draw from this pool (stable per name).
+_VOICE_POOL = [
+    ("Bill", "pqHfZKP75CvOlQylNhV4"), ("Sarah", "EXAVITQu4vr4xnSDxMaL"),
+    ("Brian", "nPczCjzI2devNBz1zQrb"), ("Daniel", "onwK4e9ZLuTAKqWW03F9"),
+    ("Liam", "TX3LPaxmHKxFdv7VOQHJ"), ("Matilda", "XrExE9yKIg1WjnnlVkGX"),
+]
 
 
 def get_db():
@@ -199,6 +218,104 @@ def pika_check():
     return out
 
 
+@router.get("/styles")
+def list_styles():
+    """Visual style presets usable with /from-liner (or a spec's "style" key)."""
+    return {"default": "hyperreal",
+            "styles": [{"id": k, "prompt_suffix": v.strip()} for k, v in _STYLE_SUFFIX.items()]}
+
+
+@router.post("/from-liner")
+def episode_from_liner(data: Dict[str, Any], db: Session = Depends(get_db)):
+    """One-liner -> full episode spec, written by an LLM on the Pika key (costs
+    fractions of a cent). Stores the episode as SCRIPT_READY with a script
+    preview — review it, then run /generate when ready."""
+    liner = (data.get("one_liner") or "").strip()
+    if not liner:
+        raise HTTPException(400, "one_liner is required")
+    style = (data.get("style") or "hyperreal").strip().lower()
+    if style not in _STYLE_SUFFIX:
+        raise HTTPException(400, f"unknown style '{style}' — see GET /sketch/styles")
+    key = (settings.pika_api_key or "").strip()
+    if not key:
+        raise HTTPException(400, "PIKA_API_KEY not set on server")
+    prompt = (
+        'You write scripts for "Faith vs Views", a vertical (9:16) AI short-drama series '
+        "where hosts debate faith and Bible-themed claims, with an off-screen narrator bridging beats.\n\n"
+        f'One-liner idea: "{liner}"\n\n'
+        "Write a complete episode spec as STRICT JSON (no markdown fences, no commentary) with EXACTLY this shape:\n"
+        '{"title": str, "claim": str, "characters": {"<firstname lowercase>": {"voice_id": "LOCK_ON_FIRST_GENERATION", '
+        '"description": "<10-20 word visual: age, hair, wardrobe>"}, "narrator": {"voice_id": "LOCK_ON_FIRST_GENERATION", '
+        '"description": "off-screen narrator"}}, "scenes": [...]}\n'
+        "Scene shapes:\n"
+        '- talking scene: {"scene": int, "still_prompt": "<setting, 5-12 words>", '
+        '"performance_prompt": "<delivery + gestures, 6-12 words>", '
+        '"dialogue": [{"speaker": "<name>", "line": "<max 18 words, punchy conversational>"}]}\n'
+        '- narrator bridge: {"scene": int, "still_prompt": "<cinematic setting>", '
+        '"motion_prompt": "<slow camera move, 4-8 words>", "lip_sync": "off", '
+        '"dialogue": [{"speaker": "narrator", "line": "<max 30 words>"}]}\n'
+        "Rules:\n"
+        "- 2 named hosts with opposing viewpoints; keep each host's wardrobe description identical across the spec.\n"
+        "- 4 to 6 scenes. Scene 1 is a talking scene opening on the strongest hook line. "
+        "Alternate talking scenes and narrator bridges. Final scene ends on a cliffhanger teasing the next episode.\n"
+        "- Dialogue sounds like real speech: short sentences, no preaching.\n"
+        "- Every speaker value must be a key in characters.")
+    try:
+        r = requests.post(f"{_pika_base()}/v1/chat/completions",
+                          headers={"X-API-Key": key, "Content-Type": "application/json"},
+                          json={"model": os.getenv("SKETCH_LLM_MODEL", "moonshotai/kimi-k3"),
+                                "messages": [{"role": "user", "content": prompt}],
+                                "max_tokens": 2500},
+                          timeout=120)
+        if r.status_code != 200:
+            return {"ok": False, "status": r.status_code, "detail": _redact(r.text[:300])}
+        text = r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return {"ok": False, "reason": _redact(e)}
+    i, j = text.find("{"), text.rfind("}")
+    if i < 0 or j <= i:
+        return {"ok": False, "reason": "LLM returned no JSON", "raw": text[:400]}
+    try:
+        spec = json.loads(text[i:j + 1])
+    except Exception as e:
+        return {"ok": False, "reason": f"JSON parse failed: {e}", "raw": text[i:i + 400]}
+
+    # Harden the spec against LLM sloppiness before storing it.
+    scenes = spec.get("scenes")
+    if not isinstance(scenes, list) or not scenes:
+        return {"ok": False, "reason": "spec has no scenes", "raw": text[:400]}
+    chars = spec.get("characters") or {}
+    if not isinstance(chars, dict) or not chars:
+        return {"ok": False, "reason": "spec has no characters", "raw": text[:400]}
+    chars.setdefault("narrator", {"voice_id": "LOCK_ON_FIRST_GENERATION",
+                                  "description": "off-screen narrator"})
+    for name, c in chars.items():
+        if isinstance(c, dict) and not (c.get("voice_id") or "").strip():
+            c["voice_id"] = "LOCK_ON_FIRST_GENERATION"
+    for idx, scene in enumerate(scenes, 1):
+        scene["scene"] = idx
+        for line in scene.get("dialogue", []):
+            spk = (line.get("speaker") or "narrator").strip().lower()
+            line["speaker"] = spk
+            if spk not in chars:
+                chars[spk] = {"voice_id": "LOCK_ON_FIRST_GENERATION", "description": spk}
+    spec["characters"] = chars
+    spec["episode_id"] = (data.get("episode_id") or "").strip() or f"fvv-{uuid.uuid4().hex[:4]}"
+    spec["title"] = (data.get("title") or spec.get("title") or liner[:60]).strip()
+    spec["claim"] = spec.get("claim") or liner
+    spec["orientation"] = "portrait"
+    spec["style"] = style
+    created = create_episode(spec, db)
+    preview = [{"scene": s["scene"],
+                "kind": "narrator_bridge" if all((l.get("speaker") or "narrator") == "narrator"
+                                                 for l in s.get("dialogue", [])) else "talking",
+                "lines": [f"{l.get('speaker')}: {l.get('line')}" for l in s.get("dialogue", [])]}
+               for s in scenes]
+    return {"ok": True, "episode": created, "style": style, "script_preview": preview,
+            "note": "Review the script. Happy? POST /sketch/episodes/{id}/generate. "
+                    "Not happy? POST /from-liner again with a tweaked one_liner or a fixed episode_id to replace it."}
+
+
 @router.get("/pika-job/{job_id}")
 def pika_job_status(job_id: str):
     """Fetch a Pika job's full status JSON (usage, charge, error code) —
@@ -330,7 +447,15 @@ def _voice_for(speaker: str, chars: Dict[str, Any], voice_map: Dict[str, str]) -
     if cid and cid != "LOCK_ON_FIRST_GENERATION":
         voice_map[speaker] = cid
         return cid
-    vid = (os.getenv(f"SKETCH_VOICE_{speaker.upper()}") or "").strip() or settings.elevenlabs_voice_id
+    vid = (os.getenv(f"SKETCH_VOICE_{speaker.upper()}") or "").strip()
+    if not vid:
+        if speaker.strip().lower() == "narrator":
+            vid = settings.elevenlabs_voice_id
+        else:
+            # one-liner characters: stable distinct premade voice per name
+            import hashlib
+            idx = int(hashlib.md5(speaker.strip().lower().encode()).hexdigest(), 16) % len(_VOICE_POOL)
+            vid = _VOICE_POOL[idx][1]
     voice_map[speaker] = vid
     return vid
 
@@ -674,6 +799,8 @@ def _generate_episode(ep_pk: str):
         # "avatar" uses full Kling AI Avatar v2 (needs balance > ~$13.50 because
         # Pika pre-authorizes the 300s worst case at submit).
         talk_mode = (os.getenv("SKETCH_TALK_MODE") or "lipsync").strip().lower()
+        style_suffix = _STYLE_SUFFIX.get(str(spec.get("style") or "hyperreal").strip().lower(),
+                                         _STYLE_SUFFIX["hyperreal"])
         jobs: list = []
         render_report["balance_start_usd"] = _pika_balance_usd()
 
@@ -763,8 +890,9 @@ def _generate_episode(ep_pk: str):
                         close_prompt = (
                             f"tight close-up portrait of {speaker}"
                             + (f", {desc}" if desc and desc != speaker else "")
-                            + ", facing camera, photorealistic, dramatic cinematic lighting"
-                            + (f", scene context: {scene.get('still_prompt')}" if scene.get("still_prompt") else ""))
+                            + ", facing camera, dramatic cinematic lighting"
+                            + (f", scene context: {scene.get('still_prompt')}" if scene.get("still_prompt") else "")
+                            + style_suffix)
                         _still(close_prompt, close, orient, jobs, f"s{n} close:{speaker}")
                     if not os.path.exists(close):
                         fail_reason = f"close-up still failed for {speaker}: {_STILL_LAST_ERROR or 'unknown'}"
@@ -874,7 +1002,8 @@ def _generate_episode(ep_pk: str):
 
             _progress(db, ep, f"scene {n}: still")
             still = f"{still_dir}/s{n}.png"
-            _still(scene.get("still_prompt") or ep.title or "Faith vs Views", still, orient, jobs, f"s{n} still")
+            _still((scene.get("still_prompt") or ep.title or "Faith vs Views") + style_suffix,
+                   still, orient, jobs, f"s{n} still")
 
             motion = f"{still_dir}/s{n}.mp4"
             has_motion = False
