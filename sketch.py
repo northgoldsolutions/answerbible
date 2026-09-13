@@ -268,16 +268,18 @@ def episode_from_liner(data: Dict[str, Any], db: Session = Depends(get_db)):
                           headers={"X-API-Key": key, "Content-Type": "application/json"},
                           json={"model": os.getenv("SKETCH_LLM_MODEL", "moonshotai/kimi-k3"),
                                 "messages": [{"role": "user", "content": prompt}],
-                                "max_tokens": 2500},
-                          timeout=120)
+                                "max_tokens": 6000},
+                          timeout=180)
         if r.status_code != 200:
             return {"ok": False, "status": r.status_code, "detail": _redact(r.text[:300])}
-        text = r.json()["choices"][0]["message"]["content"]
+        choice = r.json()["choices"][0]
+        text = choice["message"].get("content") or ""
+        finish = f"finish={choice.get('finish_reason')}, reasoning={bool(choice['message'].get('reasoning_content'))}"
     except Exception as e:
         return {"ok": False, "reason": _redact(e)}
     i, j = text.find("{"), text.rfind("}")
     if i < 0 or j <= i:
-        return {"ok": False, "reason": "LLM returned no JSON", "raw": text[:400]}
+        return {"ok": False, "reason": f"LLM returned no JSON ({finish})", "raw": text[:400]}
     try:
         spec = json.loads(text[i:j + 1])
     except Exception as e:
