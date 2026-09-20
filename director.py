@@ -159,7 +159,7 @@ class Director:
             s.tts_line = self.llm.script_beat(topic, s.phase, s.beat_title,
                                               s.word_budget, v.tone)
         if use_gate and v.gate_profile != "off":
-            man.gates_run, man.gates_flagged = run_gates(v.gate_profile, "SCRIPT_TEXT")
+            man.gates_run, man.gates_flagged = run_gates(v.gate_profile, "SCRIPT_TEXT", llm=self.llm)
         return man
 
 # ------------------------------------------------------------------ pricing --
@@ -186,17 +186,25 @@ def estimate_cost(man: AssetManifest, vertical: Vertical) -> dict:
 class LiveLLM(LLMClient):
     """Wire your existing OpenAI client. Falls back to MockLLM if no key."""
     def __init__(self, model: str = "gpt-4o-mini", client=None):
+        self.live, self.reason, self.c = False, "", None
+        self.model = model
+        if client is not None:
+            self.c, self.live = client, True
+            return
+        import os
+        if not os.environ.get("OPENAI_API_KEY"):
+            self.reason = "OPENAI_API_KEY not visible to this process (add+restart, or wrong service)"
+            return
         try:
             from openai import OpenAI
-            self.c = client or OpenAI()          # uses OPENAI_API_KEY env
-            self.model = model
-        except Exception:
-            self.c = None
-            self.model = model
+            self.c = OpenAI()                    # uses OPENAI_API_KEY env
+            self.live = True
+        except Exception as e:
+            self.reason = f"openai package missing or init failed: {e}"
 
     def _chat(self, system: str, user: str, max_tokens: int = 1200) -> str:
-        if self.c is None:
-            return MockLLM().research(user)
+        if not self.live:
+            raise RuntimeError(f"LiveLLM not live: {self.reason}")
         r = self.c.chat.completions.create(
             model=self.model,
             messages=[{"role": "system", "content": system},
@@ -205,6 +213,8 @@ class LiveLLM(LLMClient):
         return r.choices[0].message.content
 
     def research(self, topic: str) -> str:
+        if not self.live:
+            return MockLLM().research(topic)
         return self._chat(
             "You are a research lead for a documentary crew. Produce a tight fact "
             "dossier: key facts with dates, contested points, and 5-8 scene-worthy "
@@ -212,6 +222,8 @@ class LiveLLM(LLMClient):
             f"Topic: {topic}")
 
     def script_beat(self, topic, phase, beat_title, word_budget, tone) -> str:
+        if not self.live:
+            return MockLLM().script_beat(topic, phase, beat_title, word_budget, tone)
         return self._chat(
             f"You are a documentary narrator. Tone: {tone}. Write EXACTLY "
             f"{word_budget} words of narration for this beat. Plain prose, no "
@@ -243,11 +255,13 @@ def run_gates(profile: str, script_text: str, llm: LLMClient | None = None) -> t
     for gate in GATE_PROFILES.get(profile, []):
         run.append(gate)
         rubric = GATE_RUBRICS.get(gate, "Flag inaccuracies.")
-        verdict = llm._chat(
-            "You are a compliance gate for a documentary script. Reply with ONLY "
-            "JSON: {\"status\": \"PASS\" | \"FLAG\", \"issues\": [\"...\"]}",
-            f"Gate: {gate}\nRubric: {rubric}\n\nScript:\n{script_text[:6000]}")
+        if getattr(llm, "live", True) is False:
+            continue
         try:
+            verdict = llm._chat(
+                "You are a compliance gate for a documentary script. Reply with ONLY "
+                "JSON: {\"status\": \"PASS\" | \"FLAG\", \"issues\": [\"...\"]}",
+                f"Gate: {gate}\nRubric: {rubric}\n\nScript:\n{script_text[:6000]}")
             m = _re.search(r"\{.*\}", verdict, _re.S)
             v = json.loads(m.group(0)) if m else {}
             if v.get("status") == "FLAG":

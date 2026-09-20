@@ -35,6 +35,9 @@ def load_vertical(name: str) -> Vertical:
 @router.post("/api/direct")
 def direct(req: DirectRequest):
     v = load_vertical(req.vertical)
-    man = Director(v, llm=LiveLLM()).plan(req.topic, req.minutes, req.use_gate)
-    return {"status": "planned", "manifest": json.loads(json.dumps(man, default=vars)),
+    llm = LiveLLM()
+    man = Director(v, llm=llm).plan(req.topic, req.minutes, req.use_gate)
+    return {"status": "planned", "llm_mode": "live" if llm.live else "mock",
+            "llm_note": llm.reason,
+            "manifest": json.loads(json.dumps(man, default=vars)),
             "cost": estimate_cost(man, v)}
