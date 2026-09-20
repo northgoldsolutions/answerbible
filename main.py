@@ -1,7 +1,9 @@
 # main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
+import base64
+import lzma
 import os
 
 from models import init_db, get_engine
@@ -10,8 +12,11 @@ from sketch import router as sketch_router
 from video_providers import provider_status
 from config import settings
 from api import router as direct_router
+from dashboard_payload import DASHBOARD_HTML_XZ_B64
 
 app = FastAPI(title="Answers in Faith Engine", version="1.2.1")
+
+DASHBOARD_HTML = lzma.decompress(base64.b64decode(DASHBOARD_HTML_XZ_B64)).decode("utf-8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +32,10 @@ init_db(engine)
 app.include_router(pipeline_router, prefix="/api")
 app.include_router(sketch_router, prefix="/sketch")
 app.include_router(direct_router)
+
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)
 
 @app.get("/health")
 def health():
