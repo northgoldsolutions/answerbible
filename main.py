@@ -12,10 +12,12 @@ from sketch import router as sketch_router
 from video_providers import provider_status
 from config import settings
 from api import router as direct_router
-from dashboard_payload import DASHBOARD_HTML_XZ_B64
+from dashboard_payload import DASHBOARD_HTML_XZ_B64 as _DASHBOARD_HTML_XZ_B64
 
 app = FastAPI(title="Answers in Faith Engine", version="1.2.1")
 
+# Repair one transport typo in the committed payload before decoding.
+DASHBOARD_HTML_XZ_B64 = _DASHBOARD_HTML_XZ_B64.replace("OgbMbezZvYQDen", "OgbMbezZvYDen")
 DASHBOARD_HTML = lzma.decompress(base64.b64decode(DASHBOARD_HTML_XZ_B64)).decode("utf-8")
 
 app.add_middleware(
