@@ -9,6 +9,7 @@ from pipeline import router as pipeline_router
 from sketch import router as sketch_router
 from video_providers import provider_status
 from config import settings
+from api import router as direct_router
 
 app = FastAPI(title="Answers in Faith Engine", version="1.2.1")
 
@@ -25,6 +26,7 @@ init_db(engine)
 
 app.include_router(pipeline_router, prefix="/api")
 app.include_router(sketch_router, prefix="/sketch")
+app.include_router(direct_router)
 
 @app.get("/health")
 def health():

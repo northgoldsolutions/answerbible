@@ -1,0 +1,9 @@
+{
+  "name": "finance",
+  "display_name": "Money & Business",
+  "gate_profile": "finance",
+  "tone": "clear, no hype, educational",
+  "visual_style": "clean charts, office cinematic, blue-grey grade",
+  "diagram_ratio": 0.18,
+  "caption_style": "data-card captions"
+}
