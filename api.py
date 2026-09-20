@@ -5,11 +5,16 @@ POST /api/direct/produce -> turn that plan into a real rendered production
 """
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
 import uuid
+import wave
 from pathlib import Path
 from typing import Any
+
+import requests
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
@@ -73,6 +78,76 @@ def direct(req: DirectRequest):
     }
 
 
+FENRIR_VOICE_NAME = "Fenrir"
+GEMINI_TTS_MODELS = (
+    "gemini-3.1-flash-tts-preview",
+    "gemini-2.5-flash-preview-tts",  # fallback for keys without 3.1 access
+)
+
+
+def _director_voice_name(prod: Production) -> str | None:
+    """Finance Director renders use Fenrir; other verticals keep the existing chain."""
+    source = (getattr(prod, "source_question", "") or "").lower()
+    if source.startswith("director / finance /"):
+        return FENRIR_VOICE_NAME
+    return None
+
+
+def _gemini_tts(text: str, output_path: str, voice_name: str = FENRIR_VOICE_NAME) -> bool:
+    """Generate one scene of narration with Gemini TTS and write a WAV file."""
+    api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    if not api_key or not text.strip():
+        return False
+
+    preferred = (os.getenv("GEMINI_TTS_MODEL") or "").strip()
+    models = [preferred] if preferred else list(GEMINI_TTS_MODELS)
+    payload = {
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice_name}
+                }
+            },
+        },
+    }
+
+    for model in models:
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                json=payload,
+                timeout=120,
+            )
+            if resp.status_code != 200:
+                print(f"[TTS] Gemini {model} ERROR {resp.status_code}: {resp.text[:240]}")
+                continue
+            candidate = (resp.json().get("candidates") or [{}])[0]
+            parts = ((candidate.get("content") or {}).get("parts") or [])
+            inline = next((p.get("inlineData") or p.get("inline_data") or {} for p in parts), {})
+            audio_b64 = inline.get("data")
+            if not audio_b64:
+                print(f"[TTS] Gemini {model} returned no audio data")
+                continue
+            audio = base64.b64decode(audio_b64)
+            mime = str(inline.get("mimeType") or inline.get("mime_type") or "")
+            rate_match = re.search(r"rate=(\d+)", mime)
+            sample_rate = int(rate_match.group(1)) if rate_match else 24000
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with wave.open(output_path, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)  # Gemini L16 PCM is signed 16-bit little-endian
+                wav.setframerate(sample_rate)
+                wav.writeframes(audio)
+            print(f"[TTS] Gemini voice {voice_name} generated {output_path} via {model}")
+            return True
+        except Exception as e:
+            print(f"[TTS] Gemini {model} exception: {type(e).__name__}: {e}")
+    return False
+
+
 def _scene_visual_type(scene: dict[str, Any]) -> str:
     kind = str(scene.get("visual_type") or "still").strip().lower()
     return kind if kind in {"still", "motion", "diagram", "broll"} else "still"
@@ -107,7 +182,16 @@ def _prepare_director_visuals_then_produce(prod_id: str):
             .order_by(DBScene.order_index)
             .all()
         )
+        voice_name = _director_voice_name(prod)
         for scene in scenes:
+            if voice_name and not scene.narration_audio_path:
+                audio_path = f"{settings.output_dir}/audio/{scene.id}.wav"
+                if _gemini_tts(scene.narration_text or prod.topic, audio_path, voice_name):
+                    scene.narration_audio_path = audio_path
+                    db.commit()
+                else:
+                    print(f"[TTS] Fenrir unavailable for scene {scene.order_index + 1}; existing TTS fallback will handle it")
+
             kind = (scene.generation_status or "").split(":", 1)[-1].lower()
             if kind == "motion":
                 continue
@@ -241,6 +325,7 @@ def direct_produce(req: DirectProduceRequest, background_tasks: BackgroundTasks)
         "status": "production_started",
         "production_id": prod_id,
         "scene_count": len(scenes),
+        "voice": FENRIR_VOICE_NAME if vertical_name == "finance" else "default",
         "poll_url": f"/api/productions/{prod_id}",
         "message": "Video rendering started. Open the production to watch progress.",
     }
