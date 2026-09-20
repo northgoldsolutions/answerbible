@@ -19,6 +19,9 @@ app = FastAPI(title="Answers in Faith Engine", version="1.2.1")
 # Repair one transport typo in the committed payload before decoding.
 DASHBOARD_HTML_XZ_B64 = _DASHBOARD_HTML_XZ_B64.replace("OgbMbezZvYQDen", "OgbMbezZvYDen")
 DASHBOARD_HTML = lzma.decompress(base64.b64decode(DASHBOARD_HTML_XZ_B64)).decode("utf-8")
+# A JavaScript comment in the dashboard source contains a literal closing script
+# tag, which makes browsers treat the remaining JavaScript as page text.
+DASHBOARD_HTML = DASHBOARD_HTML.replace("(paste before </script>)", "(paste before script end)")
 
 app.add_middleware(
     CORSMiddleware,
