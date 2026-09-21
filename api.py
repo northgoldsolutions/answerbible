@@ -441,14 +441,12 @@ def _prepare_director_visuals_then_produce(prod_id: str):
 
             kind = (scene.generation_status or "").split(":", 1)[-1].lower()
             # Only pre-generate a still image for scenes the pipeline will
-            # actually assemble as stills. "motion", "broll", and "diagram"
-            # are video-clip slots: let pipeline.generate_scene_visual()
-            # handle them (Seedance/etc.), otherwise a stale .png gets
-            # written over a clip slot and the renderer stalls. Note: we
-            # treat "diagram" as a still only when a dedicated diagram
-            # provider isn't wired up; current _openai_image can't make
-            # diagrams so treat it as a still for now.
-            if kind in ("motion", "broll"):
+            # actually assemble as stills. "motion" is a video-clip slot:
+            # let pipeline.generate_scene_visual() handle it (Seedance/etc.).
+            # "broll" and "diagram" are ASSEMBLED AS STILLS (Ken Burns /
+            # cross-dissolve in the compositor) — generate a still for them
+            # here so the assembler never gets stuck waiting on a video clip.
+            if kind == "motion":
                 # Make sure no leftover stale PNG from a prior run blocks
                 # these scenes from going through the video provider.
                 for ext in (".png", ".mp4", ".jpg", ".webp"):
@@ -459,9 +457,6 @@ def _prepare_director_visuals_then_produce(prod_id: str):
                     except OSError:
                         pass
                 continue
-            if kind == "diagram":
-                # Diagrams are rendered as stylized stills by _openai_image.
-                pass
             out_path = f"{settings.output_dir}/visuals/{scene.id}.png"
             prompt = scene.visual_prompt or scene.narration_text or prod.topic
             if _openai_image(
@@ -471,7 +466,7 @@ def _prepare_director_visuals_then_produce(prod_id: str):
                 style=getattr(prod, "visual_style", None),
             ):
                 scene.visual_path = out_path
-                scene.generation_status = "done:openai_image"
+                scene.generation_status = f"done:openai_image_broll" if kind == "broll" else "done:openai_image"
                 db.commit()
                 print(f"[Director] Still visual ready for scene {scene.order_index + 1}")
             else:
