@@ -206,7 +206,8 @@ class Director:
                                                    s.word_budget, v.tone)
                 man.notes.append(f"LLM fallback on scene {s.index}: {err}")
         if use_gate and v.gate_profile != "off":
-            man.gates_run, man.gates_flagged = run_gates(v.gate_profile, "SCRIPT_TEXT", llm=self.llm)
+            script_text = "\n\n".join(s.tts_line for s in man.scenes if s.tts_line)
+            man.gates_run, man.gates_flagged = run_gates(v.gate_profile, script_text, llm=self.llm)
         return man
 
 # ------------------------------------------------------------------ pricing --

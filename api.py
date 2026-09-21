@@ -111,6 +111,7 @@ class DirectProduceRequest(BaseModel):
     cost: dict[str, Any] | None = None
     llm_mode: str | None = None
     llm_note: str | None = None
+    ignore_gate_flags: bool = False
 
 
 def load_vertical(name: str) -> Vertical:
@@ -530,12 +531,13 @@ def direct_produce(req: DirectProduceRequest, background_tasks: BackgroundTasks)
     minutes = int(manifest.get("minutes") or 10)
     use_gate = bool(manifest.get("use_gate", True))
     gates_flagged = manifest.get("gates_flagged") or []
-    if use_gate and gates_flagged:
+    if use_gate and gates_flagged and not req.ignore_gate_flags:
         raise HTTPException(
             422,
             {
-                "message": "Compliance gates flagged this plan. Revise or regenerate before rendering.",
+                "message": "Compliance gates flagged this plan.",
                 "gates_flagged": gates_flagged,
+                "can_override": True,
             },
         )
 

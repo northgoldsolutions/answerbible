@@ -108,6 +108,7 @@ async function runDirect(){
 }
 function renderPlan(res){
   const m = res.manifest, c = res.cost;
+  window.__lastPlan = res;
   const clipsLabel = c.stills_only
     ? '<span class="badge" style="background:#7c2d12;color:#fed7aa;margin-left:6px">stills only (no motion credits)</span>'
     : ' (' + c.n_motion_clips + ' motion clip' + (c.n_motion_clips===1?'':'s') + ')';
@@ -116,27 +117,43 @@ function renderPlan(res){
   const planNotes = (m.notes && m.notes.length)
     ? '<div style="margin-top:8px;font-size:.82rem;color:#fbbf24">' +
         m.notes.map(function(n){return '• ' + esc(n);}).join('<br>') + '</div>' : '';
+  const flagged = m.gates_flagged || [];
+  const gatesBanner = flagged.length
+    ? '<div style="margin-top:10px;padding:10px 12px;background:#422006;border:1px solid #854d0e;border-radius:6px;font-size:.85rem;color:#fde68a">' +
+        '<div style="font-weight:600;margin-bottom:4px">⚠ Compliance gates flagged ' + flagged.length + ' issue' + (flagged.length===1?'':'s') + ':</div>' +
+        '<ul style="margin:4px 0 0 18px;padding:0">' + flagged.map(function(f){
+          return '<li><b>' + esc(f.gate) + ':</b> ' + (f.issues||[]).map(esc).join('; ') + '</li>';
+        }).join('') + '</ul>' +
+        '<div style="margin-top:6px;font-size:.78rem;color:#fbbf24">You can regenerate or render anyway; review before publishing.</div></div>'
+    : '';
   document.getElementById('dResult').innerHTML = '<div class="card"><b>' + esc(m.topic) + '</b>' +
     '<div class="muted">' + m.minutes + ' min · ' + esc(m.vertical) + ' · ' + m.total_words +
     ' words · ' + c.n_scenes + ' scenes · LLM ' + esc(res.llm_mode) + '</div>' +
     '<div class="cost">Estimated cost: <b>$' + c.total + '</b>' + clipsLabel + '</div>' +
-    llmNote + planNotes +
+    llmNote + planNotes + gatesBanner +
     m.scenes.map(function(s){
        return '<div class="scene"><b>' + (s.index + 1) + '. ' + esc(s.beat_title) + '</b> ' +
          '<span class="badge">' + esc(s.visual_type) + '</span><div>' + esc(s.tts_line) + '</div>' +
          '<div class="prompt">' + esc(s.visual_type === 'motion' ? s.motion_prompt : s.image_prompt) +
          '</div></div>';
     }).join('') +
-    '<div class="actions"><button onclick="produceDirectVideo()">🎥 Generate Video</button>' +
+    '<div class="actions"><button onclick="produceDirectVideo(false)">🎥 Generate Video</button>' +
+    (flagged.length ? '<button class="secondary" onclick="produceDirectVideo(true)" title="Render despite compliance flags">⚠ Render anyway</button>' : '') +
     '<button class="secondary" onclick="downloadPlan()">Download Manifest</button></div></div>';
 }
-async function produceDirectVideo(){
+async function produceDirectVideo(force){
   if (!lastPlan) return alert('Generate a plan first.');
   const statusEl = document.getElementById('dStatus');
+  const flagged = (lastPlan.manifest && lastPlan.manifest.gates_flagged) || [];
+  if (flagged.length && !force) {
+    statusEl.innerHTML = '<span class="err">Compliance gates flagged ' + flagged.length + ' issue(s). Use "⚠ Render anyway" to proceed, or regenerate the plan.</span>';
+    return;
+  }
   statusEl.innerHTML = '<span class="loading">Creating scenes and starting the render… (this can take 5–10 minutes for motion clips)</span>';
   let res;
   try {
-    res = await api('/direct/produce', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(lastPlan)});
+    const body = Object.assign({}, lastPlan, {ignore_gate_flags: !!force});
+    res = await api('/direct/produce', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   } catch(e) {
     statusEl.innerHTML = '<span class="err">Failed to start: ' + esc(e.message) + '</span>';
     return;
