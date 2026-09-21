@@ -108,18 +108,71 @@ async function runDirect(){
 }
 function renderPlan(res){
   const m = res.manifest, c = res.cost;
-  document.getElementById('dResult').innerHTML = '<div class="card"><b>' + esc(m.topic) + '</b><div class="muted">' + m.minutes + ' min · ' + esc(m.vertical) + ' · ' + m.total_words + ' words · ' + c.n_scenes + ' scenes · LLM ' + esc(res.llm_mode) + '</div><div class="cost">Estimated cost: <b>$' + c.total + '</b> (' + c.n_motion_clips + ' motion clips)</div>' +
-    m.scenes.map(s => '<div class="scene"><b>' + (s.index + 1) + '. ' + esc(s.beat_title) + '</b> <span class="badge">' + esc(s.visual_type) + '</span><div>' + esc(s.tts_line) + '</div><div class="prompt">' + esc(s.visual_type === 'motion' ? s.motion_prompt : s.image_prompt) + '</div></div>').join('') +
-    '<div class="actions"><button onclick="produceDirectVideo()">🎥 Generate Video</button><button class="secondary" onclick="downloadPlan()">Download Manifest</button></div></div>';
+  const clipsLabel = c.stills_only
+    ? '<span class="badge" style="background:#7c2d12;color:#fed7aa;margin-left:6px">stills only (no motion credits)</span>'
+    : ' (' + c.n_motion_clips + ' motion clip' + (c.n_motion_clips===1?'':'s') + ')';
+  const llmNote = (res.llm_mode !== 'live' && res.llm_note)
+    ? '<div class="err" style="font-size:.82rem;margin-top:6px">⚠ ' + esc(res.llm_note) + '</div>' : '';
+  const planNotes = (m.notes && m.notes.length)
+    ? '<div style="margin-top:8px;font-size:.82rem;color:#fbbf24">' +
+        m.notes.map(function(n){return '• ' + esc(n);}).join('<br>') + '</div>' : '';
+  document.getElementById('dResult').innerHTML = '<div class="card"><b>' + esc(m.topic) + '</b>' +
+    '<div class="muted">' + m.minutes + ' min · ' + esc(m.vertical) + ' · ' + m.total_words +
+    ' words · ' + c.n_scenes + ' scenes · LLM ' + esc(res.llm_mode) + '</div>' +
+    '<div class="cost">Estimated cost: <b>$' + c.total + '</b>' + clipsLabel + '</div>' +
+    llmNote + planNotes +
+    m.scenes.map(function(s){
+       return '<div class="scene"><b>' + (s.index + 1) + '. ' + esc(s.beat_title) + '</b> ' +
+         '<span class="badge">' + esc(s.visual_type) + '</span><div>' + esc(s.tts_line) + '</div>' +
+         '<div class="prompt">' + esc(s.visual_type === 'motion' ? s.motion_prompt : s.image_prompt) +
+         '</div></div>';
+    }).join('') +
+    '<div class="actions"><button onclick="produceDirectVideo()">🎥 Generate Video</button>' +
+    '<button class="secondary" onclick="downloadPlan()">Download Manifest</button></div></div>';
 }
 async function produceDirectVideo(){
   if (!lastPlan) return alert('Generate a plan first.');
-  document.getElementById('dStatus').innerHTML = '<span class="loading">Creating scenes and starting the render...</span>';
+  const statusEl = document.getElementById('dStatus');
+  statusEl.innerHTML = '<span class="loading">Creating scenes and starting the render… (this can take 5–10 minutes for motion clips)</span>';
+  let res;
   try {
-    const res = await api('/direct/produce', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(lastPlan)});
-    document.getElementById('dStatus').innerHTML = '<span class="ok">Video render started. Opening production...</span>';
-    setTimeout(() => loadDetail(res.production_id), 700);
-  } catch(e) { document.getElementById('dStatus').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    res = await api('/direct/produce', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(lastPlan)});
+  } catch(e) {
+    statusEl.innerHTML = '<span class="err">Failed to start: ' + esc(e.message) + '</span>';
+    return;
+  }
+  statusEl.innerHTML = '<span class="ok">Render started — polling progress. Keep this tab open; motion clips take several minutes each.</span>';
+  // Poll the production until it leaves the PRODUCTION stage, then open detail.
+  const pid = res.production_id;
+  let lastMsg = '';
+  const tick = async () => {
+    try {
+      const p = await api('/productions/' + pid);
+      const done = p.scenes.filter(s => (s.status||'').startsWith('done:')).length;
+      const total = p.scenes.length;
+      const msg = `${done}/${total} scenes ready · stage ${stageLabel(p.stage)}${p.has_video ? ' · video ready' : ''}`;
+      if (msg !== lastMsg) {
+        lastMsg = msg;
+        statusEl.innerHTML = '<span class="loading">' + esc(msg) + '</span>';
+      }
+      if (p.has_video) {
+        statusEl.innerHTML = '<span class="ok">✅ Video ready. Opening…</span>';
+        setTimeout(() => loadDetail(pid), 300);
+        return;
+      }
+      if (p.stage === 'quality_gate' || p.stage === 'published' || p.stage === 'packaging' || p.stage === 'approval') {
+        statusEl.innerHTML = '<span class="ok">Render complete (stage: ' + stageLabel(p.stage) + '). Opening…</span>';
+        setTimeout(() => loadDetail(pid), 300);
+        return;
+      }
+      // Stop polling after 20 min to avoid runaway tabs.
+      setTimeout(tick, 5000);
+    } catch(e) {
+      statusEl.innerHTML = '<span class="err">Poll error: ' + esc(e.message) + ' — will retry.</span>';
+      setTimeout(tick, 8000);
+    }
+  };
+  setTimeout(tick, 1500);
 }
 function downloadPlan(){
   if (!lastPlan) return;
